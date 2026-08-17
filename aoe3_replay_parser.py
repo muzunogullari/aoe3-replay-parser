@@ -238,7 +238,10 @@ def parse_start_objects(data, protos):
         inst, pid = struct.unpack_from("<II", data, p + 7)
         owner = data[p + 15]
         if pid in protos and owner <= 12 and 0 < inst < 50_000_000:
-            objects.setdefault(inst, (pid, owner))
+            x, z = struct.unpack_from("<ff", data, p + 17)
+            if not (0 <= x <= 10000 and 0 <= z <= 10000):
+                x = z = None
+            objects.setdefault(inst, (pid, owner, x, z))
         p += 3
     return objects
 
@@ -341,7 +344,9 @@ def parse_commands(data):
                     out["trains"].append({"t": duration, "p": player, "proto": proto})
                 size = 14 + (2 if unknown1 in (0, 2) else 0)
             elif cmd_id == 3:
-                out["builds"].append({"t": duration, "p": player, "proto": i32(pos)})
+                out["builds"].append({"t": duration, "p": player, "proto": i32(pos),
+                                      "x": round(f32(pos + 4), 1),
+                                      "z": round(f32(pos + 12), 1)})
                 size = 44
             elif cmd_id == 12:
                 size = 36 + (1 if unknown1 == 0 else 0)
@@ -427,7 +432,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None):
         events.append({"t_ms": c["t"], "type": "build",
                        "player_id": c["p"], "player": player_of(c["p"]),
                        "building": protos.get(c["proto"], f"bldg#{c['proto']}"),
-                       "proto_id": c["proto"]})
+                       "proto_id": c["proto"], "x": c["x"], "z": c["z"]})
     for c in cmds["techs"]:
         tech = techs[c["tech"]] if 0 <= c["tech"] < len(techs) else f"tech#{c['tech']}"
         events.append({"t_ms": c["t"], "type": "research",
@@ -444,8 +449,15 @@ def build_events(path, game, players, cmds, protos, techs, objects=None):
     for e in events:
         e["t"] = fmt_t(e["t_ms"])
 
+    start_objects = []
+    for inst, (pid, owner, x, z) in objects.items():
+        nm = protos.get(pid, "")
+        if 1 <= owner <= 12 and x is not None and not re.search(r"Crate|Flag", nm):
+            start_objects.append({"player_id": owner, "unit": nm,
+                                  "x": round(x, 1), "z": round(z, 1)})
     resigned = {r["slot"] for r in cmds["resigns"]}
     return {
+        "start_objects": start_objects,
         "replay": path,
         "recorded": datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
         "duration_ms": cmds["duration"],
@@ -763,51 +775,84 @@ def _activity_chart(players, events, duration_ms, colors):
     return "".join(s)
 
 
-def _page_data_js(players, events, duration_ms, colors):
-    """Compact per-page dataset + brush/details logic for the activity chart."""
-    unit_names = []
-    unit_idx = {}
-    orders, trains, alerts, chat = [], [], [], []
+def _page_data_js(players, events, duration_ms, colors, battles, start_objects):
+    """Compact per-page dataset + brush/details/map logic."""
+    unit_names, unit_idx = [], {}
+    tgt_names, tgt_idx = [], {}
+
+    def uidx(u):
+        if u not in unit_idx:
+            unit_idx[u] = len(unit_names)
+            unit_names.append(u)
+        return unit_idx[u]
+
+    orders, trains, builds, alerts, flares, chat = [], [], [], [], [], []
     kind_code = {"move": 0, "target": 1, "control": 2}
     for e in events:
         ts = e["t_ms"] // 1000
         if e["type"] == "order":
             k = 3 if e.get("target_owner") == "Gaia" else kind_code[e["kind"]]
-            orders.append([ts, e["player_id"], k, e["units_selected"]])
+            if k == 2:
+                orders.append([ts, e["player_id"], k, e["units_selected"]])
+            else:
+                tname = (f'{e["target_owner"]} {e["target_unit"]}'
+                         if e.get("target_unit") and e.get("target_owner") != "Gaia" else None)
+                if tname is not None and tname not in tgt_idx:
+                    tgt_idx[tname] = len(tgt_names)
+                    tgt_names.append(tname)
+                orders.append([ts, e["player_id"], k, e["units_selected"],
+                               round(e["x"]), round(e["z"]),
+                               tgt_idx.get(tname, -1)])
         elif e["type"] == "train":
-            if e["unit"] not in unit_idx:
-                unit_idx[e["unit"]] = len(unit_names)
-                unit_names.append(e["unit"])
-            trains.append([ts, e["player_id"], unit_idx[e["unit"]]])
-        elif e["type"] == "flare" or (e["type"] == "system" and "alerted danger" in e["text"]):
+            trains.append([ts, e["player_id"], uidx(e["unit"])])
+        elif e["type"] == "build":
+            builds.append([ts, e["player_id"], uidx(e["building"]),
+                           round(e["x"]), round(e["z"])])
+        elif e["type"] == "flare":
+            flares.append([ts, e["player_id"], round(e["x"]), round(e["z"])])
+            alerts.append([ts, e["player_id"]])
+        elif e["type"] == "system" and "alerted danger" in e["text"]:
             alerts.append([ts, e.get("player_id") or 0])
         elif e["type"] == "chat":
             chat.append([ts, e["player_id"], e["text"][:120]])
+    coords = ([o[4] for o in orders if len(o) > 4] + [o[5] for o in orders if len(o) > 4]
+              + [b[3] for b in builds] + [b[4] for b in builds])
+    mapsz = max(coords + [400])
+    mapsz = ((mapsz // 100) + 1) * 100
     data = {
         "dur": duration_ms // 1000,
         "players": [[p["id"], p["name"]] for p in players],
         "colors": {p["id"]: colors[p["id"]] for p in players},
-        "units": unit_names, "orders": orders, "trains": trains,
-        "alerts": alerts, "chat": chat,
-        "geom": {"L": 130, "PW": 706, "W": 860},
+        "units": unit_names, "tnames": tgt_names,
+        "orders": orders, "trains": trains, "builds": builds,
+        "alerts": alerts, "flares": flares, "chat": chat,
+        "battles": [[i + 1, w["start"] // 1000, w["end"] // 1000,
+                     round(w["loc"][0]) if w["loc"] else -1,
+                     round(w["loc"][1]) if w["loc"] else -1] for i, w in enumerate(battles)],
+        "sobj": [[o["player_id"], uidx(o["unit"]), round(o["x"]), round(o["z"])]
+                 for o in start_objects],
+        "geom": {"L": 130, "PW": 706, "W": 860, "MS": mapsz},
     }
     return "const D = " + json.dumps(data, separators=(",", ":")) + ";" + """
 function fmt(s){return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');}
 function inR(t,a,b){return t>=a&&t<b;}
 function render(a,b){
   document.getElementById('selrange').textContent=fmt(a)+' – '+fmt(b);
-  let rows='<tr><th>Player</th><th>Attack orders</th><th>Gather</th><th>Moves</th><th>Peak army</th><th>Alerts</th><th>Units queued</th></tr>';
+  let rows='<tr><th>Player</th><th>Attack orders</th><th>Gather</th><th>Moves</th><th>Peak army</th><th>Alerts</th><th>Targets</th><th>Units queued</th></tr>';
   for(const [pid,name] of D.players){
     const o=D.orders.filter(e=>e[1]===pid&&inR(e[0],a,b));
     const tgt=o.filter(e=>e[2]===1).length, mv=o.filter(e=>e[2]===0).length, ga=o.filter(e=>e[2]===3).length;
     const peak=o.reduce((m,e)=>Math.max(m,e[3]),0);
     const al=D.alerts.filter(e=>e[1]===pid&&inR(e[0],a,b)).length;
+    const tg={};
+    for(const e of o) if(e.length>6&&e[6]>=0) tg[D.tnames[e[6]]]=(tg[D.tnames[e[6]]]||0)+1;
+    const tgl=Object.entries(tg).sort((x,y)=>y[1]-x[1]).map(([u,n])=>u+' ×'+n).join(', ');
     const tc={};
     for(const t of D.trains) if(t[1]===pid&&inR(t[0],a,b)) tc[D.units[t[2]]]=(tc[D.units[t[2]]]||0)+1;
     const tl=Object.entries(tc).sort((x,y)=>y[1]-x[1]).map(([u,n])=>u+' ×'+n).join(', ');
     rows+=`<tr><td><span class="chip" style="background:${D.colors[pid]}"></span>${name}</td>
       <td class="num">${tgt}</td><td class="num">${ga}</td><td class="num">${mv}</td><td class="num">${peak||'—'}</td>
-      <td class="num">${al}</td><td>${tl||'—'}</td></tr>`;
+      <td class="num">${al}</td><td>${tgl||'—'}</td><td>${tl||'—'}</td></tr>`;
   }
   let ch='';
   for(const c of D.chat) if(inR(c[0],a,b)){
@@ -815,6 +860,27 @@ function render(a,b){
     ch+=`<div><span class="num">${fmt(c[0])}</span> <span class="num">${name}:</span> ${c[2].replace(/</g,'&lt;')}</div>`;
   }
   document.getElementById('seldetail').innerHTML='<table>'+rows+'</table>'+(ch?'<div style="margin-top:8px">'+ch+'</div>':'');
+  renderMap(a,b);
+}
+function renderMap(a,b){
+  const g=document.getElementById('maplayer');
+  if(!g)return;
+  const S=D.geom.MS, Y=z=>S-z;
+  let s='';
+  for(const bd of D.builds) if(inR(bd[0],a,b))
+    s+=`<rect x="${bd[3]-3.5}" y="${Y(bd[4])-3.5}" width="7" height="7" fill="${D.colors[bd[1]]}" stroke="var(--surface)" stroke-width="1" data-tip="${(D.players.find(p=>p[0]===bd[1])||[0,'?'])[1]}: ${D.units[bd[2]]} at ${fmt(bd[0])}"/>`;
+  for(const k of [0,3,1]){
+    const os=D.orders.filter(e=>e.length>4&&e[2]===k&&inR(e[0],a,b));
+    const step=Math.max(1,Math.ceil(os.length/3000));
+    for(let i=0;i<os.length;i+=step){
+      const e=os[i];
+      if(k===1) s+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="2.6" fill="${D.colors[e[1]]}"/>`;
+      else s+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="1.3" fill="${D.colors[e[1]]}" opacity="${k===0?0.3:0.14}"/>`;
+    }
+  }
+  for(const f of D.flares) if(inR(f[0],a,b))
+    s+=`<g stroke="${D.colors[f[1]]}" stroke-width="2.4"><line x1="${f[2]-6}" y1="${Y(f[3])-6}" x2="${f[2]+6}" y2="${Y(f[3])+6}"/><line x1="${f[2]-6}" y1="${Y(f[3])+6}" x2="${f[2]+6}" y2="${Y(f[3])-6}"/></g>`;
+  g.innerHTML=s;
 }
 const svg=document.getElementById('actsvg');
 if(svg){
@@ -837,6 +903,44 @@ if(svg){
   render(0,D.dur);
 }
 """
+
+
+def _map_svg(doc, battles, colors):
+    """Static map frame: grid, start objects, numbered battle markers, and an
+    empty layer the page script fills with brushed-range activity."""
+    coords = []
+    for e in doc["events"]:
+        if e["type"] in ("order", "build", "flare") and "x" in e:
+            coords += [e["x"], e["z"]]
+    mapsz = max([c for c in coords if c is not None] + [400])
+    mapsz = (int(mapsz) // 100 + 1) * 100
+    s = [f'<svg id="mapsvg" viewBox="0 0 {mapsz} {mapsz}" xmlns="http://www.w3.org/2000/svg" '
+         f'font-family="system-ui" font-size="13">']
+    s.append(f'<rect width="{mapsz}" height="{mapsz}" fill="var(--surface)" stroke="var(--grid)"/>')
+    for gline in range(100, mapsz, 100):
+        s.append(f'<line x1="{gline}" y1="0" x2="{gline}" y2="{mapsz}" stroke="var(--grid)" stroke-width="0.6"/>')
+        s.append(f'<line x1="0" y1="{gline}" x2="{mapsz}" y2="{gline}" stroke="var(--grid)" stroke-width="0.6"/>')
+    for o in doc["start_objects"]:
+        y = mapsz - o["z"]
+        s.append(f'<rect x="{o["x"] - 4:.0f}" y="{y - 4:.0f}" width="8" height="8" '
+                 f'fill="none" stroke="{colors.get(o["player_id"], "var(--muted)")}" stroke-width="2" '
+                 f'data-tip="{pname_map(doc, o["player_id"])}: {o["unit"]} (start)"/>')
+    for i, w in enumerate(battles, 1):
+        if not w["loc"]:
+            continue
+        x, y = w["loc"][0], mapsz - w["loc"][1]
+        s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="11" fill="none" stroke="var(--muted)" '
+                 f'stroke-width="1.5" data-tip="Battle {i}: {fmt_t(w["start"])}–{fmt_t(w["end"])}"/>')
+        s.append(f'<text x="{x:.0f}" y="{y + 4:.0f}" text-anchor="middle" fill="var(--muted)">{i}</text>')
+    s.append('<g id="maplayer"></g></svg>')
+    return "".join(s)
+
+
+def pname_map(doc, pid):
+    for p in doc["players"]:
+        if p["id"] == pid:
+            return p["name"]
+    return f"player{pid}"
 
 
 def build_html(doc):
@@ -911,6 +1015,15 @@ def build_html(doc):
     out.append("</section>")
     out.append('<h2>Selection <span id="selrange" class="num"></span></h2>'
                '<section id="seldetail"></section>')
+
+    # map: brushed-range activity over map coordinates
+    out.append('<h2>Map (selection)</h2>'
+               '<section class="chart" style="max-width:540px;margin:0 auto">')
+    out.append(_map_svg(doc, battles, colors))
+    out.append('<div class="num" style="font-size:12px;margin-top:6px">'
+               '&#9633; start building &nbsp; &#9632; building placed &nbsp; '
+               '&#9679; attack order &nbsp; &#183; move/gather &nbsp; '
+               '&#10005; flare &nbsp; &#9675; battle</div></section>')
 
     # production charts
     def is_villager(u):
@@ -1013,7 +1126,8 @@ def build_html(doc):
 
     out.append("</main>")
 
-    data_js = _page_data_js(players, events, doc["duration_ms"], colors)
+    data_js = _page_data_js(players, events, doc["duration_ms"], colors,
+                            battles, doc["start_objects"])
     return ("<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>{H.escape(map_disp)} {doc['recorded'][:10]}</title>"

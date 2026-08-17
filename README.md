@@ -40,7 +40,10 @@ python aoe3_replay_parser.py "path\to\Record Game.age3Yrec" -j out.json --html r
 timeline (age-ups, shipments, battles, resigns), an interactive activity
 histogram (unit orders per player per 10 seconds — drag to select a time
 range and inspect attack orders, gather orders, moves, peak army size,
-alerts, units queued and chat within it), auto-detected battles (activity
+alerts, resolved targets, units queued and chat within it), a map view that
+plots the selected range spatially (attack orders, moves, buildings placed,
+flares, start buildings and numbered battle sites at their map coordinates),
+auto-detected battles (activity
 spikes + danger alerts, with map locations, per-player attack-order counts,
 peak army sizes and resolvable targets), villager/military production
 curves, eco upgrade timings, units trained, buildings and shipments.
