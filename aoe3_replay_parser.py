@@ -188,9 +188,13 @@ def _parse_node(data, elements, attrs, p, visit, depth=0):
 
 
 def build_name_tables(data):
-    """proto id -> unit name, and tech ordinal -> tech name, from the
-    embedded runtime protoy/techtreey XMB documents."""
+    """From the embedded runtime protoy/techtreey XMB documents:
+    proto id -> unit name, tech ordinal -> tech name, and the simulation
+    data needed for spend reconstruction: per-unit cost + train batch size
+    and per-tech cost."""
     protos, techs = {}, []
+    unit_info = {}   # proto id -> {"cost": {res: amt}, "batch": int}
+    tech_costs = []  # ordinal -> {res: amt}
     for off in _find_xmb_docs(data, limit=4):
         try:
             elements, attrs, body = _xmb_tables(data, off)
@@ -198,19 +202,44 @@ def build_name_tables(data):
             continue
         root = elements[0] if elements else ""
         if root == "proto":
+            state = {"cur": None}
+
             def visit(elem, a, text, depth):
                 if elem == "unit" and "id" in a and "name" in a:
                     try:
-                        protos[int(a["id"])] = a["name"]
+                        pid = int(a["id"])
                     except ValueError:
-                        pass
-                    return False
+                        return False
+                    protos[pid] = a["name"]
+                    state["cur"] = unit_info.setdefault(pid, {"cost": {}, "batch": 1})
+                    return True
+                if depth == 2 and state["cur"] is not None:
+                    if elem == "cost" and "resourcetype" in a:
+                        try:
+                            state["cur"]["cost"][a["resourcetype"]] = float(text)
+                        except ValueError:
+                            pass
+                    elif elem == "trainbatchsize":
+                        try:
+                            state["cur"]["batch"] = max(1, int(float(text)))
+                        except ValueError:
+                            pass
                 return depth == 0
         elif root == "techtree":
+            tstate = {"cur": None}
+
             def visit(elem, a, text, depth):
                 if elem == "tech" and depth == 1:
                     techs.append(a.get("name") or "?")
-                    return False
+                    tstate["cur"] = {}
+                    tech_costs.append(tstate["cur"])
+                    return True
+                if depth == 2 and tstate["cur"] is not None:
+                    if elem == "cost" and "resourcetype" in a:
+                        try:
+                            tstate["cur"][a["resourcetype"]] = float(text)
+                        except ValueError:
+                            pass
                 return depth == 0
         else:
             continue
@@ -221,7 +250,7 @@ def build_name_tables(data):
             pass
         if protos and techs:
             break
-    return protos, techs
+    return protos, techs, unit_info, tech_costs
 
 
 # ------------------------------------------------------- start-world objects
@@ -386,9 +415,19 @@ def pname(players, slot):
     return p["name"] if p else f"player{slot}"
 
 
-def build_events(path, game, players, cmds, protos, techs, objects=None):
+def build_events(path, game, players, cmds, protos, techs, objects=None,
+                 unit_info=None, tech_costs=None):
     """Every action from the replay as one flat timestamped event list (JSON)."""
     objects = objects or {}
+    unit_info = unit_info or {}
+    tech_costs = tech_costs or []
+
+    def unit_cost(proto_id):
+        info = unit_info.get(proto_id)
+        if not info or not info["cost"]:
+            return None, 1
+        batch = info["batch"]
+        return {r: round(v * batch) for r, v in info["cost"].items()}, batch
 
     def player_of(slot):
         return None if slot == 0 else pname(players, slot)
@@ -429,20 +468,31 @@ def build_events(path, game, players, cmds, protos, techs, objects=None):
                            "to_id": m["to"], "text": msg})
     for c in cmds["trains"]:
         nm = protos.get(c["proto"], f"unit#{c['proto']}")
-        events.append({"t_ms": c["t"],
-                       "type": "placement" if PLACEMENT_PAT.search(nm) else "train",
-                       "player_id": c["p"], "player": player_of(c["p"]),
-                       "unit": nm, "proto_id": c["proto"]})
+        cost, batch = unit_cost(c["proto"])
+        e = {"t_ms": c["t"],
+             "type": "placement" if PLACEMENT_PAT.search(nm) else "train",
+             "player_id": c["p"], "player": player_of(c["p"]),
+             "unit": nm, "proto_id": c["proto"], "count": batch}
+        if cost:
+            e["cost"] = cost
+        events.append(e)
     for c in cmds["builds"]:
-        events.append({"t_ms": c["t"], "type": "build",
-                       "player_id": c["p"], "player": player_of(c["p"]),
-                       "building": protos.get(c["proto"], f"bldg#{c['proto']}"),
-                       "proto_id": c["proto"], "x": c["x"], "z": c["z"]})
+        cost, _ = unit_cost(c["proto"])
+        e = {"t_ms": c["t"], "type": "build",
+             "player_id": c["p"], "player": player_of(c["p"]),
+             "building": protos.get(c["proto"], f"bldg#{c['proto']}"),
+             "proto_id": c["proto"], "x": c["x"], "z": c["z"]}
+        if cost:
+            e["cost"] = cost
+        events.append(e)
     for c in cmds["techs"]:
         tech = techs[c["tech"]] if 0 <= c["tech"] < len(techs) else f"tech#{c['tech']}"
-        events.append({"t_ms": c["t"], "type": "research",
-                       "player_id": c["p"], "player": player_of(c["p"]),
-                       "tech": tech, "tech_id": c["tech"]})
+        e = {"t_ms": c["t"], "type": "research",
+             "player_id": c["p"], "player": player_of(c["p"]),
+             "tech": tech, "tech_id": c["tech"]}
+        if 0 <= c["tech"] < len(tech_costs) and tech_costs[c["tech"]]:
+            e["cost"] = {r: round(v) for r, v in tech_costs[c["tech"]].items()}
+        events.append(e)
     for c in cmds["shipments"]:
         events.append({"t_ms": c["t"], "type": "shipment",
                        "player_id": c["p"], "player": player_of(c["p"]),
@@ -670,8 +720,9 @@ def _step_chart(series, duration_ms, colors, tip_label):
     for i in range(0, 5):
         v = ymax * i / 4
         y = Y(v)
+        lbl = f"{v / 1000:g}k" if ymax >= 10000 else f"{v:.0f}"
         s.append(f'<line x1="{L}" y1="{y:.1f}" x2="{L + pw}" y2="{y:.1f}" stroke="var(--grid)" stroke-width="1"/>')
-        s.append(f'<text x="{L - 6}" y="{y + 3:.1f}" text-anchor="end" fill="var(--muted)">{v:.0f}</text>')
+        s.append(f'<text x="{L - 6}" y="{y + 3:.1f}" text-anchor="end" fill="var(--muted)">{lbl}</text>')
     for t in _x_ticks(duration_ms):
         x = X(t)
         s.append(f'<text x="{x:.1f}" y="{H - 8}" text-anchor="middle" fill="var(--muted)">{t // 60000}m</text>')
@@ -696,8 +747,9 @@ def _step_chart(series, duration_ms, colors, tip_label):
             ends[k] = (ends[k - 1][0] + 14, ends[k][1], ends[k][2])
     for y, pid, v in ends:
         x = L + pw + 8
+        vl = f"{v / 1000:.1f}k" if v >= 10000 else str(v)
         s.append(f'<circle cx="{x + 4}" cy="{y - 3:.1f}" r="4" fill="{colors[pid]}"/>')
-        s.append(f'<text x="{x + 12}" y="{y:.1f}" fill="var(--ink-2)">{tip_label[pid][:12]} · {v}</text>')
+        s.append(f'<text x="{x + 12}" y="{y:.1f}" fill="var(--ink-2)">{tip_label[pid][:12]} · {vl}</text>')
     s.append("</svg>")
     return "".join(s)
 
@@ -807,7 +859,7 @@ def _page_data_js(players, events, duration_ms, colors, battles, start_objects):
             unit_names.append(u)
         return unit_idx[u]
 
-    orders, trains, builds, alerts, flares, chat = [], [], [], [], [], []
+    orders, trains, builds, alerts, flares = [], [], [], [], []
     kind_code = {"move": 0, "target": 1, "control": 2}
     for e in events:
         ts = e["t_ms"] // 1000
@@ -834,8 +886,6 @@ def _page_data_js(players, events, duration_ms, colors, battles, start_objects):
             alerts.append([ts, e["player_id"]])
         elif e["type"] == "system" and "alerted danger" in e["text"]:
             alerts.append([ts, e.get("player_id") or 0])
-        elif e["type"] == "chat":
-            chat.append([ts, e["player_id"], e["text"][:120]])
     coords = ([o[4] for o in orders if len(o) > 4] + [o[5] for o in orders if len(o) > 4]
               + [b[3] for b in builds] + [b[4] for b in builds])
     mapsz = max(coords + [400])
@@ -846,7 +896,7 @@ def _page_data_js(players, events, duration_ms, colors, battles, start_objects):
         "colors": {p["id"]: colors[p["id"]] for p in players},
         "units": unit_names, "tnames": tgt_names,
         "orders": orders, "trains": trains, "builds": builds,
-        "alerts": alerts, "flares": flares, "chat": chat,
+        "alerts": alerts, "flares": flares,
         "battles": [[i + 1, w["start"] // 1000, w["end"] // 1000,
                      round(w["loc"][0]) if w["loc"] else -1,
                      round(w["loc"][1]) if w["loc"] else -1] for i, w in enumerate(battles)],
@@ -875,12 +925,7 @@ function render(a,b){
       <td class="num">${tgt}</td><td class="num">${ga}</td><td class="num">${mv}</td><td class="num">${peak||'—'}</td>
       <td class="num">${al}</td><td>${tgl||'—'}</td><td>${tl||'—'}</td></tr>`;
   }
-  let ch='';
-  for(const c of D.chat) if(inR(c[0],a,b)){
-    const name=(D.players.find(p=>p[0]===c[1])||[0,'?'])[1];
-    ch+=`<div><span class="num">${fmt(c[0])}</span> <span class="num">${name}:</span> ${c[2].replace(/</g,'&lt;')}</div>`;
-  }
-  document.getElementById('seldetail').innerHTML='<table>'+rows+'</table>'+(ch?'<div style="margin-top:8px">'+ch+'</div>':'');
+  document.getElementById('seldetail').innerHTML='<table>'+rows+'</table>';
   renderMap(a,b);
 }
 function renderMap(a,b){
@@ -1055,21 +1100,68 @@ def build_html(doc):
                    f"<td{cls}>{result}</td></tr>")
     out.append("</table></section>")
 
-    # age-ups
-    ages = defaultdict(dict)
+    # ---- cumulative state helpers ----
+    from bisect import bisect_right
+
+    def is_villager(u):
+        return u == "Coureur" or u.startswith("Settler") or "Villager" in u
+
+    def is_military(u):
+        return not is_villager(u) and not u.startswith("Fishing") and not any(
+            u.startswith(x) for x in ("Sheep", "Cow", "Goat", "Llama", "Pet"))
+
+    vill_t = {p["id"]: [] for p in players}
+    mil_t = {p["id"]: [] for p in players}      # (t, cumulative units)
+    sp_t = {p["id"]: [] for p in players}       # (t, cumulative resources spent)
+    sp_res = {p["id"]: Counter() for p in players}
+    mil_run, sp_run = Counter(), Counter()
     for e in events:
-        if e["type"] == "system":
-            m = re.search(r"(.+) has reached the (\w+) AGE", e["text"])
-            if m and m.group(2) not in ages[m.group(1)]:
-                ages[m.group(1)][m.group(2)] = e["t"]
-    order = ["COMMERCE", "FORTRESS", "INDUSTRIAL", "IMPERIAL"]
-    out.append("<h2>Age-Ups</h2><section><table>")
-    out.append("<tr><th>Player</th>" + "".join(f"<th>{a.title()}</th>" for a in order) + "</tr>")
-    for p in players:
-        row = ages.get(p["name"], {})
-        out.append(f"<tr><td>{chip(p['id'])}{esc(p['name'])}</td>"
-                   + "".join(f"<td>{row.get(a, '—')}</td>" for a in order) + "</tr>")
-    out.append("</table></section>")
+        pid = e.get("player_id")
+        if e["type"] == "train":
+            if is_villager(e["unit"]):
+                vill_t[pid].append(e["t_ms"])
+            elif is_military(e["unit"]):
+                mil_run[pid] += e.get("count", 1)
+                mil_t[pid].append((e["t_ms"], mil_run[pid]))
+        if e.get("cost") and pid in sp_res:
+            sp_res[pid].update(e["cost"])
+            sp_run[pid] += sum(e["cost"].values())
+            sp_t[pid].append((e["t_ms"], sp_run[pid]))
+    start_vills = Counter()
+    for o in doc["start_objects"]:
+        if is_villager(o["unit"]):
+            start_vills[o["player_id"]] += 1
+    autovill = {p["id"]: p["civ"] == "Ottomans" for p in players}
+
+    def _cum_at(pairs, t):
+        lo, hi = 0, len(pairs)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if pairs[mid][0] <= t:
+                lo = mid + 1
+            else:
+                hi = mid
+        return pairs[lo - 1][1] if lo else 0
+
+    def vills_at(pid, t):
+        if autovill.get(pid):
+            return "auto"
+        return start_vills[pid] + bisect_right(vill_t[pid], t)
+
+    def mil_at(pid, t):
+        return _cum_at(mil_t[pid], t)
+
+    def fmt_k(v):
+        return f"{v / 1000:.1f}k" if v >= 1000 else str(int(v))
+
+    def spent_at(pid, t):
+        return _cum_at(sp_t[pid], t)
+
+    def state_cells(t):
+        return "".join(f'<td class="num">{vills_at(p["id"], t)} v · '
+                       f'{mil_at(p["id"], t)} m<br>'
+                       f'<span style="color:var(--muted)">{fmt_k(spent_at(p["id"], t))} spent</span></td>'
+                       for p in players)
 
     battles = find_battles(events, doc["duration_ms"])
     tip_label = {p["id"]: p["name"] for p in players}
@@ -1078,6 +1170,137 @@ def build_html(doc):
     out.append('<h2>Timeline</h2><section class="chart">')
     out.append(_timeline_chart(players, events, battles, doc["duration_ms"], colors))
     out.append("</section>")
+
+    # aging: per age-up event, everyone's villager / military-trained state
+    age_events = []
+    seen_age = set()
+    for e in events:
+        if e["type"] == "system":
+            m = re.search(r"(.+) has reached the (\w+) AGE", e["text"])
+            if m and (m.group(1), m.group(2)) not in seen_age:
+                seen_age.add((m.group(1), m.group(2)))
+                age_events.append((e["t_ms"], m.group(1), m.group(2).title()))
+    name_to_id = {p["name"]: p["id"] for p in players}
+    out.append("<h2>Aging (state of all players at each age-up)</h2><section><table>")
+    out.append("<tr><th>Time</th><th>Age-up</th>" + "".join(
+        f"<th>{chip(p['id'])}{esc(p['name'])}</th>" for p in players) + "</tr>")
+    for t, who, age in age_events:
+        pid = name_to_id.get(who)
+        out.append(f"<tr><td>{fmt_t(t)}</td><td>{chip(pid) if pid else ''}{esc(who)} → {age}</td>"
+                   + state_cells(t) + "</tr>")
+    out.append("</table></section>")
+
+    # economy
+    def cumulative(pred):
+        series = {p["id"]: [] for p in players}
+        counts = Counter()
+        for e in events:
+            if e["type"] == "train" and pred(e["unit"]):
+                counts[e["player_id"]] += e.get("count", 1)
+                series[e["player_id"]].append((e["t_ms"], counts[e["player_id"]]))
+        return series
+
+    MIL_BLD = re.compile(r"Barracks|Stable|ArtilleryDepot|Blockhouse|Outpost|Fort|"
+                         r"Wall|Arsenal|Corral|Tower")
+    builds = defaultdict(Counter)
+    for e in events:
+        if e["type"] == "build":
+            builds[e["player_id"]][e["building"]] += 1
+
+    out.append('<h2>Economy (villager production, cumulative)</h2><section class="chart">')
+    out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+    out.append('<h2>Economy (resources spent on units, buildings and research, cumulative)</h2>'
+               '<section class="chart">')
+    out.append(_step_chart(sp_t, doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+    out.append("<h2>Resources Spent (totals)</h2><section><table>")
+    res_cols = ["Food", "Wood", "Gold"]
+    out.append("<tr><th>Player</th>" + "".join(f"<th>{r}</th>" for r in res_cols)
+               + "<th>Total</th></tr>")
+    for p in players:
+        c = sp_res[p["id"]]
+        out.append(f"<tr><td>{chip(p['id'])}{esc(p['name'])}</td>"
+                   + "".join(f'<td class="num">{fmt_k(c.get(r, 0))}</td>' for r in res_cols)
+                   + f'<td class="num">{fmt_k(sum(c.values()))}</td></tr>')
+    out.append("</table></section>")
+    ECO = {"HuntingDogs", "SteelTraps", "Gangsaw", "LogFlume", "PlacerMines",
+           "Amalgamation", "SeedDrill", "ArtificialFertilizer", "Homesteading",
+           "SteamPower", "WaterPower", "CircularSaw", "Bookkeeping", "GasLighting",
+           "Refineries", "Cannery", "EconomicTheory", "GillNets", "LongLines"}
+    eco = defaultdict(dict)
+    for e in events:
+        if e["type"] == "research" and e["tech"] in ECO and e["player_id"] not in eco[e["tech"]]:
+            eco[e["tech"]][e["player_id"]] = e["t"]
+    if eco:
+        rows = sorted(eco.items(), key=lambda kv: min(kv[1].values()))
+        out.append("<h2>Economy Upgrades (research time)</h2><section><table>")
+        out.append("<tr><th>Upgrade</th>" + "".join(
+            f"<th>{chip(p['id'])}{esc(p['name'])}</th>" for p in players) + "</tr>")
+        for tech, times in rows:
+            disp = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", tech)
+            out.append(f"<tr><td>{esc(disp)}</td>" + "".join(
+                f"<td>{times.get(p['id'], '—')}</td>" for p in players) + "</tr>")
+        out.append("</table></section>")
+    out.append("<h2>Economy Buildings</h2><section><table>")
+    for p in players:
+        items = ", ".join(f"{b} ×{n}" for b, n in builds.get(p["id"], Counter()).most_common()
+                          if not MIL_BLD.search(b))
+        out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
+                   f"<td>{esc(items) or '—'}</td></tr>")
+    out.append("</table></section>")
+
+    # military
+    out.append('<h2>Military (production, cumulative train commands)</h2><section class="chart">')
+    out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+    trains = defaultdict(Counter)
+    for e in events:
+        if e["type"] == "train":
+            trains[e["player_id"]][e["unit"]] += e.get("count", 1)
+    peak = max((n for c in trains.values() for n in c.values()), default=1)
+    out.append("<h2>Military Units Trained</h2><section><table>")
+    out.append("<tr><th>Player</th><th>Unit</th><th>Units queued</th></tr>")
+    for p in players:
+        rows = [(u, n) for u, n in trains.get(p["id"], Counter()).most_common()
+                if is_military(u)]
+        for j, (unit, n) in enumerate(rows):
+            w = max(6, round(n / peak * 220))
+            name_cell = f"{chip(p['id'])}{esc(p['name'])}" if j == 0 else ""
+            out.append(f'<tr><td>{name_cell}</td><td>{esc(unit)}</td>'
+                       f'<td><span class="bar" style="width:{w}px;background:{colors[p["id"]]}"'
+                       f' title="{esc(unit)}: {n}"></span><span class="num">{n}</span></td></tr>')
+    out.append("</table></section>")
+    out.append("<h2>Military Buildings</h2><section><table>")
+    for p in players:
+        items = ", ".join(f"{b} ×{n}" for b, n in builds.get(p["id"], Counter()).most_common()
+                          if MIL_BLD.search(b))
+        out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
+                   f"<td>{esc(items) or '—'}</td></tr>")
+    out.append("</table></section>")
+
+    # shipments
+    ships = defaultdict(list)
+    for e in events:
+        if e["type"] == "shipment":
+            ships[e["player_id"]].append(e["t"])
+    out.append("<h2>Shipments</h2><section><table>")
+    for p in players:
+        ts = ships.get(p["id"], [])
+        out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
+                   f"<td class='num'>{len(ts)}</td><td>{esc(', '.join(ts))}</td></tr>")
+    out.append("</table></section>")
+
+    # improvements: every research, chronological
+    out.append("<h2>Improvements (research queued)</h2><section><table>")
+    out.append("<tr><th>Time</th><th>Player</th><th>Improvement</th></tr>")
+    for e in events:
+        if e["type"] == "research":
+            disp = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", e["tech"])
+            out.append(f'<tr><td>{e["t"]}</td>'
+                       f'<td>{chip(e["player_id"])}{esc(e["player"])}</td>'
+                       f"<td>{esc(disp)}</td></tr>")
+    out.append("</table></section>")
 
     # activity histogram with brush selection
     out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
@@ -1095,50 +1318,6 @@ def build_html(doc):
                '&#9633; start building &nbsp; &#9632; building placed &nbsp; '
                '&#9679; attack order &nbsp; &#183; move/gather &nbsp; '
                '&#10005; flare &nbsp; &#9675; battle</div></section>')
-
-    # production charts
-    def is_villager(u):
-        return u == "Coureur" or u.startswith("Settler") or "Villager" in u
-
-    def is_military(u):
-        return not is_villager(u) and not u.startswith("Fishing") and not any(
-            u.startswith(x) for x in ("Sheep", "Cow", "Goat", "Llama", "Pet"))
-
-    def cumulative(pred):
-        series = {p["id"]: [] for p in players}
-        counts = Counter()
-        for e in events:
-            if e["type"] == "train" and pred(e["unit"]):
-                counts[e["player_id"]] += 1
-                series[e["player_id"]].append((e["t_ms"], counts[e["player_id"]]))
-        return series
-
-    out.append('<h2>Villager Production (cumulative train commands)</h2><section class="chart">')
-    out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
-    out.append("</section>")
-    out.append('<h2>Military Production (cumulative train commands)</h2><section class="chart">')
-    out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
-    out.append("</section>")
-
-    # eco upgrade timing
-    ECO = {"HuntingDogs", "SteelTraps", "Gangsaw", "LogFlume", "PlacerMines",
-           "Amalgamation", "SeedDrill", "ArtificialFertilizer", "Homesteading",
-           "SteamPower", "WaterPower", "CircularSaw", "Bookkeeping", "GasLighting",
-           "Refineries", "Cannery", "EconomicTheory", "GillNets", "LongLines"}
-    eco = defaultdict(dict)
-    for e in events:
-        if e["type"] == "research" and e["tech"] in ECO and e["player_id"] not in eco[e["tech"]]:
-            eco[e["tech"]][e["player_id"]] = e["t"]
-    if eco:
-        rows = sorted(eco.items(), key=lambda kv: min(kv[1].values()))
-        out.append("<h2>Eco Upgrades (research time)</h2><section><table>")
-        out.append("<tr><th>Upgrade</th>" + "".join(
-            f"<th>{chip(p['id'])}{esc(p['name'])}</th>" for p in players) + "</tr>")
-        for tech, times in rows:
-            disp = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", tech)
-            out.append(f"<tr><td>{esc(disp)}</td>" + "".join(
-                f"<td>{times.get(p['id'], '—')}</td>" for p in players) + "</tr>")
-        out.append("</table></section>")
 
     # battles
     mapsz = _map_size(doc)
@@ -1162,6 +1341,11 @@ def build_html(doc):
                     parts.append(f'{chip(p["id"])}{esc(p["name"])} '
                                  f'<span class="num">{n} orders, army {army}</span>')
             out.append(f'<div class="bside">{" &nbsp; ".join(parts) if parts else "—"}</div>')
+        state = " &nbsp; ".join(f'{chip(p["id"])}<span class="num">'
+                                f'{vills_at(p["id"], w["start"])} v · '
+                                f'{mil_at(p["id"], w["start"])} m · '
+                                f'{fmt_k(spent_at(p["id"], w["start"]))}</span>' for p in players)
+        out.append(f'<div class="bside bt">At start (v · military · spent): {state}</div>')
         if w["targets"]:
             tg = ", ".join(f"{esc(name)} ×{n}" for name, n in w["targets"])
             out.append(f'<div class="bside bt">Hit: {tg}</div>')
@@ -1171,48 +1355,6 @@ def build_html(doc):
                            f'(ransom {e["amount"]} coin → {esc(e["paid_to"])})</div>')
         out.append("</div></div>")
     out.append("</div>")
-
-    # units trained (bars per player color; direct-labeled)
-    trains = defaultdict(Counter)
-    for e in events:
-        if e["type"] == "train":
-            trains[e["player_id"]][e["unit"]] += 1
-    peak = max((n for c in trains.values() for n in c.values()), default=1)
-    out.append("<h2>Units Trained</h2><section><table>")
-    out.append("<tr><th>Player</th><th>Unit</th><th>Train commands</th></tr>")
-    for p in players:
-        rows = trains.get(p["id"], Counter()).most_common()
-        for j, (unit, n) in enumerate(rows):
-            w = max(6, round(n / peak * 220))
-            name_cell = f"{chip(p['id'])}{esc(p['name'])}" if j == 0 else ""
-            out.append(f'<tr><td>{name_cell}</td><td>{esc(unit)}</td>'
-                       f'<td><span class="bar" style="width:{w}px;background:{colors[p["id"]]}"'
-                       f' title="{esc(unit)}: {n}"></span><span class="num">{n}</span></td></tr>')
-    out.append("</table></section>")
-
-    # buildings
-    builds = defaultdict(Counter)
-    for e in events:
-        if e["type"] == "build":
-            builds[e["player_id"]][e["building"]] += 1
-    out.append("<h2>Buildings</h2><section><table>")
-    for p in players:
-        items = ", ".join(f"{b} ×{n}" for b, n in builds.get(p["id"], Counter()).most_common())
-        out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
-                   f"<td>{esc(items)}</td></tr>")
-    out.append("</table></section>")
-
-    # shipments
-    ships = defaultdict(list)
-    for e in events:
-        if e["type"] == "shipment":
-            ships[e["player_id"]].append(e["t"])
-    out.append("<h2>Shipments</h2><section><table>")
-    for p in players:
-        ts = ships.get(p["id"], [])
-        out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
-                   f"<td class='num'>{len(ts)}</td><td>{esc(', '.join(ts))}</td></tr>")
-    out.append("</table></section>")
 
     out.append("</main>")
 
@@ -1369,7 +1511,7 @@ def main():
     path = args.replay or find_latest_replay()
     data = load(path)
     game, players = parse_settings(data)
-    protos, techs = build_name_tables(data)
+    protos, techs, unit_info, tech_costs = build_name_tables(data)
     cmds = parse_commands(data)
     objects = parse_start_objects(data, protos)
     stem = file_stem(path, game)
@@ -1377,7 +1519,8 @@ def main():
     def resolve(arg, ext):
         return f"{stem}.{ext}" if arg == "auto" else arg
 
-    doc = build_events(path, game, players, cmds, protos, techs, objects)
+    doc = build_events(path, game, players, cmds, protos, techs, objects,
+                       unit_info, tech_costs)
     wrote_any = False
     if args.json:
         target = resolve(args.json, "json")

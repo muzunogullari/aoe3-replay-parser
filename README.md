@@ -36,18 +36,29 @@ python aoe3_replay_parser.py -j -o --html
 python aoe3_replay_parser.py "path\to\Record Game.age3Yrec" -j out.json --html report.html
 ```
 
-`--html` writes a single-file post-game page: players and result, a game
-timeline (age-ups, shipments, battles, resigns), an interactive activity
-histogram (unit orders per player per 10 seconds — drag to select a time
-range and inspect attack orders, gather orders, moves, peak army size,
-alerts, resolved targets, units queued and chat within it), a map view that
-plots the selected range spatially (attack orders, moves, buildings placed,
-flares, start buildings and numbered battle sites at their map coordinates),
-auto-detected battles (activity
-spikes + danger alerts, with map locations, per-player attack-order counts,
-peak army sizes and resolvable targets), villager/military production
-curves, eco upgrade timings, units trained, buildings and shipments.
-Light/dark follows the OS.
+`--html` writes a single-file post-game page, split into: Players · Timeline
+· Aging (every age-up with all players' villagers, military and resources
+spent at that moment) · Economy (villager production, cumulative resources
+spent, spend totals per resource, economy upgrade timings, economy
+buildings) · Military (production curve, units trained, military buildings)
+· Shipments · Improvements (all research, chronological) · Activity (orders
+per player per 10s — drag to select a range and inspect attack/gather/move
+orders, peak army, alerts, resolved targets and units queued) · Map (the
+selected range plotted spatially) · Battles (cards with a locator mini-map
+of every attack order and hit, sides, per-player orders and army size, and
+each player's villagers/military/spend at battle start). Light/dark follows
+the OS.
+
+### Spend reconstruction (simulation data from the game files)
+
+The replay embeds the runtime `protoy.xml`/`techtreey.xml`, which carry the
+actual simulation data: unit/building costs, train batch sizes and tech
+costs. Every train/build/research event in the JSON is annotated with its
+exact cost, and the report reconstructs cumulative resources spent per
+player — this is derived from game data plus the deterministic command
+stream, not estimated. Resource *stockpiles* and income would additionally
+require gather-rate simulation of villager task assignments, and combat
+outcomes depend on engine targeting/pathfinding, so neither is reproduced.
 
 ### Combat data: what a replay can and cannot tell you
 
