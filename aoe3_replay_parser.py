@@ -418,6 +418,11 @@ def build_events(path, game, players, cmds, protos, techs, objects=None):
         elif m["from"] == 0:
             events.append({"t_ms": m["t"], "type": "system",
                            "to_id": m["to"], "to": player_of(m["to"]), "text": msg})
+            rm = re.match(r"(.+) has paid (\d+) coin to you as explorer ransom", msg)
+            if rm:
+                events.append({"t_ms": m["t"], "type": "explorer_ransom",
+                               "player": rm.group(1), "amount": int(rm.group(2)),
+                               "paid_to": player_of(m["to"])})
         else:
             events.append({"t_ms": m["t"], "type": "chat",
                            "player_id": m["from"], "player": player_of(m["from"]),
@@ -930,8 +935,10 @@ def _map_size(doc):
     return (int(mapsz) // 100 + 1) * 100
 
 
-def _battle_minimap(doc, battle, colors, mapsz):
-    """Tiny locator map for one battle: town centers + battle site."""
+def _battle_minimap(doc, battle, colors, mapsz, events):
+    """Locator map for one battle: town centers for orientation, a dot for
+    every attack order in the window, and crosses where resolved
+    buildings/units were hit."""
     s = [f'<svg viewBox="0 0 {mapsz} {mapsz}" xmlns="http://www.w3.org/2000/svg">']
     s.append(f'<rect width="{mapsz}" height="{mapsz}" rx="{mapsz * 0.03:.0f}" '
              f'fill="var(--page)" stroke="var(--grid)" stroke-width="2"/>')
@@ -940,11 +947,22 @@ def _battle_minimap(doc, battle, colors, mapsz):
             continue
         y = mapsz - o["z"]
         s.append(f'<rect x="{o["x"] - 9:.0f}" y="{y - 9:.0f}" width="18" height="18" '
-                 f'fill="{colors.get(o["player_id"], "var(--muted)")}"/>')
-    if battle["loc"]:
-        x, y = battle["loc"][0], mapsz - battle["loc"][1]
-        s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="17" fill="none" '
-                 f'stroke="var(--ink-2)" stroke-width="5"/>')
+                 f'fill="{colors.get(o["player_id"], "var(--muted)")}" opacity="0.55"/>')
+    hits = []
+    for e in events:
+        if (e["type"] == "order" and e["kind"] == "target"
+                and battle["start"] <= e["t_ms"] < battle["end"]
+                and e.get("target_owner") != "Gaia"):
+            x, y = e["x"], mapsz - e["z"]
+            s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="5" '
+                     f'fill="{colors.get(e["player_id"], "var(--muted)")}" opacity="0.75"/>')
+            if e.get("target_unit"):
+                hits.append((x, y, f'{e["player"]} → {e["target_owner"]} {e["target_unit"]} '
+                                   f'at {fmt_t(e["t_ms"])}'))
+    for x, y, tip in hits:
+        s.append(f'<g stroke="var(--ink)" stroke-width="3.5" data-tip="{tip}">'
+                 f'<line x1="{x - 8:.0f}" y1="{y - 8:.0f}" x2="{x + 8:.0f}" y2="{y + 8:.0f}"/>'
+                 f'<line x1="{x - 8:.0f}" y1="{y + 8:.0f}" x2="{x + 8:.0f}" y2="{y - 8:.0f}"/></g>')
     s.append("</svg>")
     return "".join(s)
 
@@ -1130,7 +1148,7 @@ def build_html(doc):
         loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
         total = w["count"]
         out.append('<div class="bcard">')
-        out.append(_battle_minimap(doc, w, colors, mapsz))
+        out.append(_battle_minimap(doc, w, colors, mapsz, events))
         out.append('<div style="flex:1">')
         out.append(f'<div class="bhead">Battle {i}</div>')
         out.append(f'<div class="bmeta">{fmt_t(w["start"])} – {fmt_t(w["end"])}'
@@ -1147,6 +1165,10 @@ def build_html(doc):
         if w["targets"]:
             tg = ", ".join(f"{esc(name)} ×{n}" for name, n in w["targets"])
             out.append(f'<div class="bside bt">Hit: {tg}</div>')
+        for e in events:
+            if e["type"] == "explorer_ransom" and w["start"] <= e["t_ms"] < w["end"]:
+                out.append(f'<div class="bside bt">Explorer down: {esc(e["player"])} '
+                           f'(ransom {e["amount"]} coin → {esc(e["paid_to"])})</div>')
         out.append("</div></div>")
     out.append("</div>")
 

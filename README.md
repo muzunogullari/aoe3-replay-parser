@@ -58,7 +58,10 @@ object a group of N selected units was ordered to attack, with map
 coordinates), resolved to a unit type and owner when the target existed at
 game start (buildings, explorers, starting units, huntables). Orders
 targeting Gaia objects (hunts, trees, treasures) are classified as gather,
-not combat.
+not combat. The one recorded death-adjacent event is the explorer knockdown:
+ransom payments appear in the notification feed and are emitted as
+`explorer_ransom` events (who fell, the amount, who was paid) and shown on
+the battle card for the window they fell in.
 
 The JSON document has `game` (settings), `players`, and `events` — one flat
 array where every action is its own record with `t_ms` (game-time
