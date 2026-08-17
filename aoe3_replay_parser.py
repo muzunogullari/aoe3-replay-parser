@@ -600,6 +600,16 @@ tr:last-child td { border-bottom: none; }
 .num { color: var(--ink-2); }
 .won { font-weight: 600; }
 .chart svg { display: block; width: 100%; height: auto; }
+.bcards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 720px) { .bcards { grid-template-columns: 1fr; } }
+.bcard { background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px; display: flex; gap: 12px; }
+.bcard svg { width: 96px; height: 96px; flex: none; }
+.bhead { font-weight: 600; }
+.bmeta { color: var(--muted); font-size: 13px; margin-bottom: 6px;
+  font-variant-numeric: tabular-nums; }
+.bside { padding: 3px 0; border-top: 1px solid var(--grid); font-size: 13px; }
+.bt { color: var(--ink-2); }
 .tip { position: fixed; display: none; background: var(--surface); color: var(--ink);
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
   font-size: 12px; pointer-events: none; z-index: 9;
@@ -609,13 +619,19 @@ tr:last-child td { border-bottom: none; }
 TOOLTIP_JS = """
 const tip = document.createElement('div'); tip.className = 'tip';
 document.body.appendChild(tip);
+let tipTimer = null, tipEl = null;
 document.addEventListener('mouseover', e => {
   const t = e.target.closest('[data-tip]');
-  if (t) { tip.textContent = t.dataset.tip; tip.style.display = 'block'; }
-  else tip.style.display = 'none';
+  if (t === tipEl) return;
+  tipEl = t;
+  clearTimeout(tipTimer);
+  tip.style.display = 'none';
+  if (t) tipTimer = setTimeout(() => {
+    tip.textContent = t.dataset.tip; tip.style.display = 'block';
+  }, 200);
 });
 document.addEventListener('mousemove', e => {
-  tip.style.left = Math.min(e.clientX + 12, innerWidth - 180) + 'px';
+  tip.style.left = Math.min(e.clientX + 12, innerWidth - 200) + 'px';
   tip.style.top = (e.clientY + 14) + 'px';
 });
 """
@@ -905,15 +921,52 @@ if(svg){
 """
 
 
-def _map_svg(doc, battles, colors):
-    """Static map frame: grid, start objects, numbered battle markers, and an
-    empty layer the page script fills with brushed-range activity."""
+def _map_size(doc):
     coords = []
     for e in doc["events"]:
         if e["type"] in ("order", "build", "flare") and "x" in e:
             coords += [e["x"], e["z"]]
     mapsz = max([c for c in coords if c is not None] + [400])
-    mapsz = (int(mapsz) // 100 + 1) * 100
+    return (int(mapsz) // 100 + 1) * 100
+
+
+def _battle_minimap(doc, battle, colors, mapsz):
+    """Tiny locator map for one battle: town centers + battle site."""
+    s = [f'<svg viewBox="0 0 {mapsz} {mapsz}" xmlns="http://www.w3.org/2000/svg">']
+    s.append(f'<rect width="{mapsz}" height="{mapsz}" rx="{mapsz * 0.03:.0f}" '
+             f'fill="var(--page)" stroke="var(--grid)" stroke-width="2"/>')
+    for o in doc["start_objects"]:
+        if o["unit"] != "TownCenter":
+            continue
+        y = mapsz - o["z"]
+        s.append(f'<rect x="{o["x"] - 9:.0f}" y="{y - 9:.0f}" width="18" height="18" '
+                 f'fill="{colors.get(o["player_id"], "var(--muted)")}"/>')
+    if battle["loc"]:
+        x, y = battle["loc"][0], mapsz - battle["loc"][1]
+        s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="17" fill="none" '
+                 f'stroke="var(--ink-2)" stroke-width="5"/>')
+    s.append("</svg>")
+    return "".join(s)
+
+
+def _sides(players):
+    """Group players into sides by team id; team -1 joins the smallest side."""
+    teams = defaultdict(list)
+    for p in players:
+        if p["team"] not in (None, -1):
+            teams[p["team"]].append(p)
+    if not teams:
+        return [[p] for p in players]
+    for p in players:
+        if p["team"] in (None, -1):
+            min(teams.values(), key=len).append(p)
+    return [teams[k] for k in sorted(teams)]
+
+
+def _map_svg(doc, battles, colors):
+    """Static map frame: grid, start objects, numbered battle markers, and an
+    empty layer the page script fills with brushed-range activity."""
+    mapsz = _map_size(doc)
     s = [f'<svg id="mapsvg" viewBox="0 0 {mapsz} {mapsz}" xmlns="http://www.w3.org/2000/svg" '
          f'font-family="system-ui" font-size="13">']
     s.append(f'<rect width="{mapsz}" height="{mapsz}" fill="var(--surface)" stroke="var(--grid)"/>')
@@ -1070,17 +1123,32 @@ def build_html(doc):
         out.append("</table></section>")
 
     # battles
-    out.append("<h2>Battles</h2><section><table>")
-    out.append("<tr><th>#</th><th>Time</th><th>Location</th><th>Attack orders (peak army)</th>"
-               "<th>Known targets</th></tr>")
+    mapsz = _map_size(doc)
+    sides = _sides(players)
+    out.append('<h2>Battles</h2><div class="bcards">')
     for i, w in enumerate(battles, 1):
-        span = f"{fmt_t(w['start'])} – {fmt_t(w['end'])}"
-        loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else "—"
-        per = ", ".join(f"{p} {w['orders'][p]} ({w['peak_sel'].get(p, 0)})" for p in w["players"])
-        tg = ", ".join(f"{name} ×{n}" for name, n in w["targets"]) or "—"
-        out.append(f"<tr><td>{i}</td><td>{span}</td><td>{loc}</td>"
-                   f"<td>{esc(per) or '—'}</td><td>{esc(tg)}</td></tr>")
-    out.append("</table></section>")
+        loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
+        total = w["count"]
+        out.append('<div class="bcard">')
+        out.append(_battle_minimap(doc, w, colors, mapsz))
+        out.append('<div style="flex:1">')
+        out.append(f'<div class="bhead">Battle {i}</div>')
+        out.append(f'<div class="bmeta">{fmt_t(w["start"])} – {fmt_t(w["end"])}'
+                   f'{" · " + loc if loc else ""} · {total} attack orders</div>')
+        for side in sides:
+            parts = []
+            for p in side:
+                n = w["orders"].get(p["name"], 0)
+                army = w["peak_sel"].get(p["name"], 0)
+                if n or army:
+                    parts.append(f'{chip(p["id"])}{esc(p["name"])} '
+                                 f'<span class="num">{n} orders, army {army}</span>')
+            out.append(f'<div class="bside">{" &nbsp; ".join(parts) if parts else "—"}</div>')
+        if w["targets"]:
+            tg = ", ".join(f"{esc(name)} ×{n}" for name, n in w["targets"])
+            out.append(f'<div class="bside bt">Hit: {tg}</div>')
+        out.append("</div></div>")
+    out.append("</div>")
 
     # units trained (bars per player color; direct-labeled)
     trains = defaultdict(Counter)
