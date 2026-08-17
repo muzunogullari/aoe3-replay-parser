@@ -36,9 +36,26 @@ python aoe3_replay_parser.py -j -o --html
 python aoe3_replay_parser.py "path\to\Record Game.age3Yrec" -j out.json --html report.html
 ```
 
-`--html` writes a single-file post-game page: players and result, age-up
-times, wars (clusters of danger alerts and minimap flares with locations),
-units trained, buildings, shipments and chat. Light/dark follows the OS.
+`--html` writes a single-file post-game page: players and result, a game
+timeline (age-ups, shipments, battles, resigns), an interactive activity
+histogram (unit orders per player per 10 seconds — drag to select a time
+range and inspect attack orders, gather orders, moves, peak army size,
+alerts, units queued and chat within it), auto-detected battles (activity
+spikes + danger alerts, with map locations, per-player attack-order counts,
+peak army sizes and resolvable targets), villager/military production
+curves, eco upgrade timings, units trained, buildings and shipments.
+Light/dark follows the OS.
+
+### Combat data: what a replay can and cannot tell you
+
+Replays store player **orders**, not simulation results. Damage dealt/taken,
+kills and hit points are computed by the engine during playback and are not
+in the file. What this parser extracts instead: every targeted order (which
+object a group of N selected units was ordered to attack, with map
+coordinates), resolved to a unit type and owner when the target existed at
+game start (buildings, explorers, starting units, huntables). Orders
+targeting Gaia objects (hunts, trees, treasures) are classified as gather,
+not combat.
 
 The JSON document has `game` (settings), `players`, and `events` — one flat
 array where every action is its own record with `t_ms` (game-time

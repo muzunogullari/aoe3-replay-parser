@@ -224,6 +224,25 @@ def build_name_tables(data):
     return protos, techs
 
 
+# ------------------------------------------------------- start-world objects
+
+def parse_start_objects(data, protos):
+    """Objects present at game start: instance id -> (proto id, owner).
+    Serialized as '01 4b 39' records in the initial world snapshot."""
+    objects = {}
+    p = 0
+    while True:
+        p = data.find(b"\x01\x4b\x39", p)
+        if p == -1 or p + 16 > len(data):
+            break
+        inst, pid = struct.unpack_from("<II", data, p + 7)
+        owner = data[p + 15]
+        if pid in protos and owner <= 12 and 0 < inst < 50_000_000:
+            objects.setdefault(inst, (pid, owner))
+        p += 3
+    return objects
+
+
 # ---------------------------------------------------------------- commands
 
 DELIM = bytes([0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0x19])
@@ -250,8 +269,11 @@ def parse_commands(data):
     def i32(p):
         return struct.unpack_from("<i", data, p)[0]
 
+    def f32(p):
+        return struct.unpack_from("<f", data, p)[0]
+
     out = {"messages": [], "resigns": [], "trains": [], "builds": [],
-           "techs": [], "shipments": [], "duration": 0}
+           "techs": [], "shipments": [], "orders": [], "duration": 0}
     duration = 0
     pos = data.find(DELIM)
     while True:
@@ -297,6 +319,17 @@ def parse_commands(data):
             pos += uc + 1 + 16 + 4
             if cmd_id == 0:
                 size = 24 + (8 if data[pos + 24] == 255 else 0)
+                target = i32(pos)
+                out["orders"].append({
+                    "t": duration, "p": player, "sel": sel,
+                    "kind": "target" if target != -1 else "move",
+                    "target": target if target != -1 else None,
+                    "x": round(f32(pos + 8), 1), "z": round(f32(pos + 16), 1)})
+            elif cmd_id in (4, 12, 13, 23, 24, 25, 34, 37, 46, 53, 57, 61, 63):
+                out["orders"].append({"t": duration, "p": player, "sel": sel,
+                                      "kind": "control", "cmd": cmd_id})
+            if cmd_id == 0:
+                pass
             elif cmd_id == 1:
                 out["techs"].append({"t": duration, "p": player, "tech": i32(pos)})
                 size = 4
@@ -348,12 +381,26 @@ def pname(players, slot):
     return p["name"] if p else f"player{slot}"
 
 
-def build_events(path, game, players, cmds, protos, techs):
+def build_events(path, game, players, cmds, protos, techs, objects=None):
     """Every action from the replay as one flat timestamped event list (JSON)."""
+    objects = objects or {}
+
     def player_of(slot):
         return None if slot == 0 else pname(players, slot)
 
     events = []
+    for c in cmds["orders"]:
+        e = {"t_ms": c["t"], "type": "order", "kind": c["kind"],
+             "player_id": c["p"], "player": player_of(c["p"]), "units_selected": c["sel"]}
+        if c["kind"] in ("move", "target"):
+            e["x"], e["z"] = c["x"], c["z"]
+        if c.get("target") is not None:
+            e["target_id"] = c["target"]
+            res = objects.get(c["target"])
+            if res:
+                e["target_unit"] = protos.get(res[0], f"unit#{res[0]}")
+                e["target_owner"] = player_of(res[1]) or "Gaia"
+        events.append(e)
     for m in cmds["messages"]:
         msg = ICON_PAT.sub("coin ", m["msg"]).strip()
         if not msg:
@@ -435,30 +482,73 @@ def file_stem(path, game):
     return f"aoe3_{ts:%Y-%m-%d_%H%M}_{map_name}"
 
 
-def find_wars(events, gap_ms=120_000):
-    """Cluster flares and danger alerts into engagements."""
-    alerts = []
+BUCKET_MS = 10_000
+
+
+def find_battles(events, duration_ms):
+    """Cluster combat activity into battles: 10s buckets scored by targeted
+    orders plus danger alerts/flares, thresholded, adjacent runs merged."""
+    nb = duration_ms // BUCKET_MS + 1
+    score = [0.0] * nb
+    alert_b = set()
     for e in events:
-        if e["type"] == "flare":
-            alerts.append((e["t_ms"], e["player"], (e["x"], e["z"])))
-        elif e["type"] == "system":
-            m = re.match(r"(.+) has alerted danger", e["text"])
-            if m:
-                alerts.append((e["t_ms"], m.group(1), None))
-    wars = []
-    for t, who, loc in sorted(alerts, key=lambda a: a[0]):
-        if wars and t - wars[-1]["end"] <= gap_ms:
-            w = wars[-1]
+        b = min(e["t_ms"] // BUCKET_MS, nb - 1)
+        if (e["type"] == "order" and e["kind"] == "target"
+                and e.get("target_owner") != "Gaia"):
+            score[b] += 1
+        elif e["type"] == "flare" or (e["type"] == "system" and "alerted danger" in e["text"]):
+            score[b] += 5
+            alert_b.add(b)
+    nz = [s for s in score if s > 0] or [0]
+    mean = sum(nz) / len(nz)
+    thr = max(6.0, mean * 1.6)
+    runs = []
+    i = 0
+    while i < nb:
+        if score[i] >= thr or i in alert_b:
+            j = i
+            gap = 0
+            while j + 1 < nb and gap <= 3:
+                j += 1
+                if score[j] >= thr or j in alert_b:
+                    gap = 0
+                else:
+                    gap += 1
+            j -= gap
+            runs.append((i, j))
+            i = j + 1
         else:
-            wars.append({"start": t, "end": t, "players": [], "locs": [], "count": 0})
-            w = wars[-1]
-        w["end"] = t
-        w["count"] += 1
-        if who not in w["players"]:
-            w["players"].append(who)
-        if loc and loc not in w["locs"]:
-            w["locs"].append(loc)
-    return wars
+            i += 1
+    battles = []
+    for i, j in runs:
+        t0, t1 = i * BUCKET_MS, (j + 1) * BUCKET_MS
+        has_alert = any(b in alert_b for b in range(i, j + 1))
+        if j - i < 1 and not has_alert:
+            continue
+        per_player = Counter()
+        peak_sel = Counter()
+        xs, zs = [], []
+        targets = Counter()
+        for e in events:
+            if not (t0 <= e["t_ms"] < t1):
+                continue
+            if (e["type"] == "order" and e["kind"] == "target"
+                    and e.get("target_owner") != "Gaia"):
+                per_player[e["player"]] += 1
+                peak_sel[e["player"]] = max(peak_sel[e["player"]], e["units_selected"])
+                xs.append(e["x"]); zs.append(e["z"])
+                if e.get("target_unit"):
+                    targets[f'{e["target_owner"]} {e["target_unit"]}'] += 1
+        if not per_player and not has_alert:
+            continue
+        xs.sort(); zs.sort()
+        battles.append({
+            "start": t0, "end": t1, "count": int(sum(per_player.values())),
+            "players": [p for p, _ in per_player.most_common()],
+            "orders": dict(per_player), "peak_sel": dict(peak_sel),
+            "loc": (xs[len(xs) // 2], zs[len(zs) // 2]) if xs else None,
+            "targets": targets.most_common(3), "alert": has_alert})
+    return battles
 
 
 HTML_STYLE = """
@@ -594,7 +684,7 @@ def _timeline_chart(players, events, wars, duration_ms, colors):
         x0, x1 = X(w["start"]), max(X(w["end"]), X(w["start"]) + 3)
         s.append(f'<rect x="{x0:.1f}" y="{T}" width="{x1 - x0:.1f}" height="{lane_h * len(players)}" '
                  f'fill="var(--muted)" opacity="0.18" '
-                 f'data-tip="War {i}: {fmt_t(w["start"])}–{fmt_t(w["end"])}, {w["count"]} alerts"/>')
+                 f'data-tip="Battle {i}: {fmt_t(w["start"])}–{fmt_t(w["end"])}, {w["count"]} attack orders"/>')
     for p in players:
         y = lane_y[p["id"]]
         mid = y + lane_h / 2
@@ -629,6 +719,124 @@ def _timeline_chart(players, events, wars, duration_ms, colors):
         s.append(f'<text x="{X(t):.1f}" y="{H - 8}" text-anchor="middle" fill="var(--muted)">{t // 60000}m</text>')
     s.append("</svg>")
     return "".join(s)
+
+
+def _activity_chart(players, events, duration_ms, colors):
+    """Small-multiple histograms: order events per player per 10s bucket,
+    shared scale, with a brush overlay wired up by the page script."""
+    nb = duration_ms // BUCKET_MS + 1
+    counts = {p["id"]: [0] * nb for p in players}
+    for e in events:
+        if e["type"] == "order" and e["player_id"] in counts:
+            counts[e["player_id"]][min(e["t_ms"] // BUCKET_MS, nb - 1)] += 1
+    peak = max((max(c) for c in counts.values()), default=1) or 1
+
+    W, L, R, T = 860, 130, 24, 8
+    lane_h, plot_h, B = 56, 44, 24
+    H = T + lane_h * len(players) + B
+    pw = W - L - R
+    bw = pw / nb
+    s = [f'<svg id="actsvg" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
+         f'font-family="system-ui" font-size="11" style="touch-action:none">']
+    for li, p in enumerate(players):
+        y0 = T + li * lane_h
+        base = y0 + plot_h
+        s.append(f'<line x1="{L}" y1="{base}" x2="{L + pw}" y2="{base}" stroke="var(--grid)" stroke-width="1"/>')
+        s.append(f'<circle cx="{L - 118}" cy="{y0 + plot_h / 2 - 3:.1f}" r="4" fill="{colors[p["id"]]}"/>')
+        s.append(f'<text x="{L - 108}" y="{y0 + plot_h / 2:.1f}" fill="var(--ink-2)">{p["name"][:14]}</text>')
+        s.append(f'<text x="{L - 6}" y="{y0 + 9}" text-anchor="end" fill="var(--muted)">{peak}</text>')
+        for b, n in enumerate(counts[p["id"]]):
+            if n == 0:
+                continue
+            h = max(1.5, n / peak * plot_h)
+            s.append(f'<rect x="{L + b * bw:.2f}" y="{base - h:.2f}" width="{max(bw - 0.6, 1):.2f}" '
+                     f'height="{h:.2f}" fill="{colors[p["id"]]}" '
+                     f'data-tip="{p["name"]} {fmt_t(b * BUCKET_MS)}–{fmt_t((b + 1) * BUCKET_MS)}: {n} orders"/>')
+    for t in _x_ticks(duration_ms):
+        x = L + t / duration_ms * pw
+        s.append(f'<text x="{x:.1f}" y="{H - 8}" text-anchor="middle" fill="var(--muted)">{t // 60000}m</text>')
+    s.append(f'<rect id="brushrect" x="{L}" y="{T}" width="0" height="{lane_h * len(players)}" '
+             f'fill="var(--muted)" opacity="0.22" pointer-events="none"/>')
+    s.append(f'<rect id="brushzone" x="{L}" y="{T}" width="{pw}" height="{lane_h * len(players)}" '
+             f'fill="transparent" style="cursor:crosshair"/>')
+    s.append("</svg>")
+    return "".join(s)
+
+
+def _page_data_js(players, events, duration_ms, colors):
+    """Compact per-page dataset + brush/details logic for the activity chart."""
+    unit_names = []
+    unit_idx = {}
+    orders, trains, alerts, chat = [], [], [], []
+    kind_code = {"move": 0, "target": 1, "control": 2}
+    for e in events:
+        ts = e["t_ms"] // 1000
+        if e["type"] == "order":
+            k = 3 if e.get("target_owner") == "Gaia" else kind_code[e["kind"]]
+            orders.append([ts, e["player_id"], k, e["units_selected"]])
+        elif e["type"] == "train":
+            if e["unit"] not in unit_idx:
+                unit_idx[e["unit"]] = len(unit_names)
+                unit_names.append(e["unit"])
+            trains.append([ts, e["player_id"], unit_idx[e["unit"]]])
+        elif e["type"] == "flare" or (e["type"] == "system" and "alerted danger" in e["text"]):
+            alerts.append([ts, e.get("player_id") or 0])
+        elif e["type"] == "chat":
+            chat.append([ts, e["player_id"], e["text"][:120]])
+    data = {
+        "dur": duration_ms // 1000,
+        "players": [[p["id"], p["name"]] for p in players],
+        "colors": {p["id"]: colors[p["id"]] for p in players},
+        "units": unit_names, "orders": orders, "trains": trains,
+        "alerts": alerts, "chat": chat,
+        "geom": {"L": 130, "PW": 706, "W": 860},
+    }
+    return "const D = " + json.dumps(data, separators=(",", ":")) + ";" + """
+function fmt(s){return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');}
+function inR(t,a,b){return t>=a&&t<b;}
+function render(a,b){
+  document.getElementById('selrange').textContent=fmt(a)+' – '+fmt(b);
+  let rows='<tr><th>Player</th><th>Attack orders</th><th>Gather</th><th>Moves</th><th>Peak army</th><th>Alerts</th><th>Units queued</th></tr>';
+  for(const [pid,name] of D.players){
+    const o=D.orders.filter(e=>e[1]===pid&&inR(e[0],a,b));
+    const tgt=o.filter(e=>e[2]===1).length, mv=o.filter(e=>e[2]===0).length, ga=o.filter(e=>e[2]===3).length;
+    const peak=o.reduce((m,e)=>Math.max(m,e[3]),0);
+    const al=D.alerts.filter(e=>e[1]===pid&&inR(e[0],a,b)).length;
+    const tc={};
+    for(const t of D.trains) if(t[1]===pid&&inR(t[0],a,b)) tc[D.units[t[2]]]=(tc[D.units[t[2]]]||0)+1;
+    const tl=Object.entries(tc).sort((x,y)=>y[1]-x[1]).map(([u,n])=>u+' ×'+n).join(', ');
+    rows+=`<tr><td><span class="chip" style="background:${D.colors[pid]}"></span>${name}</td>
+      <td class="num">${tgt}</td><td class="num">${ga}</td><td class="num">${mv}</td><td class="num">${peak||'—'}</td>
+      <td class="num">${al}</td><td>${tl||'—'}</td></tr>`;
+  }
+  let ch='';
+  for(const c of D.chat) if(inR(c[0],a,b)){
+    const name=(D.players.find(p=>p[0]===c[1])||[0,'?'])[1];
+    ch+=`<div><span class="num">${fmt(c[0])}</span> <span class="num">${name}:</span> ${c[2].replace(/</g,'&lt;')}</div>`;
+  }
+  document.getElementById('seldetail').innerHTML='<table>'+rows+'</table>'+(ch?'<div style="margin-top:8px">'+ch+'</div>':'');
+}
+const svg=document.getElementById('actsvg');
+if(svg){
+  const zone=document.getElementById('brushzone'), rect=document.getElementById('brushrect');
+  const G=D.geom; let x0=null;
+  const toVB=e=>{const r=svg.getBoundingClientRect();return (e.clientX-r.left)*G.W/r.width;};
+  const toT=x=>Math.round(Math.min(Math.max((x-G.L)/G.PW,0),1)*D.dur);
+  zone.addEventListener('pointerdown',e=>{x0=toVB(e);zone.setPointerCapture(e.pointerId);});
+  zone.addEventListener('pointermove',e=>{
+    if(x0===null)return;
+    const x1=toVB(e), a=Math.min(x0,x1), w=Math.abs(x1-x0);
+    rect.setAttribute('x',Math.max(a,G.L)); rect.setAttribute('width',w);
+  });
+  zone.addEventListener('pointerup',e=>{
+    const x1=toVB(e);
+    if(Math.abs(x1-x0)<4){rect.setAttribute('width',0);render(0,D.dur);}
+    else render(toT(Math.min(x0,x1)),toT(Math.max(x0,x1)));
+    x0=null;
+  });
+  render(0,D.dur);
+}
+"""
 
 
 def build_html(doc):
@@ -688,13 +896,21 @@ def build_html(doc):
                    + "".join(f"<td>{row.get(a, '—')}</td>" for a in order) + "</tr>")
     out.append("</table></section>")
 
-    wars = find_wars(events)
+    battles = find_battles(events, doc["duration_ms"])
     tip_label = {p["id"]: p["name"] for p in players}
 
-    # timeline: age-ups, shipments, wars, resigns on one axis
+    # timeline: age-ups, shipments, battles, resigns on one axis
     out.append('<h2>Timeline</h2><section class="chart">')
-    out.append(_timeline_chart(players, events, wars, doc["duration_ms"], colors))
+    out.append(_timeline_chart(players, events, battles, doc["duration_ms"], colors))
     out.append("</section>")
+
+    # activity histogram with brush selection
+    out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
+               '<section class="chart">')
+    out.append(_activity_chart(players, events, doc["duration_ms"], colors))
+    out.append("</section>")
+    out.append('<h2>Selection <span id="selrange" class="num"></span></h2>'
+               '<section id="seldetail"></section>')
 
     # production charts
     def is_villager(u):
@@ -740,14 +956,17 @@ def build_html(doc):
                 f"<td>{times.get(p['id'], '—')}</td>" for p in players) + "</tr>")
         out.append("</table></section>")
 
-    # wars
-    out.append("<h2>Wars</h2><section><table>")
-    out.append("<tr><th>#</th><th>Time</th><th>Alerts</th><th>Flagged by</th><th>Locations</th></tr>")
-    for i, w in enumerate(wars, 1):
-        span = fmt_t(w["start"]) + (f" – {fmt_t(w['end'])}" if w["end"] - w["start"] >= 1000 else "")
-        locs = ", ".join(f"({x:.0f}, {z:.0f})" for x, z in w["locs"][:4]) or "—"
-        out.append(f"<tr><td>{i}</td><td>{span}</td><td class=\"num\">{w['count']}</td>"
-                   f"<td>{esc(', '.join(w['players']))}</td><td>{locs}</td></tr>")
+    # battles
+    out.append("<h2>Battles</h2><section><table>")
+    out.append("<tr><th>#</th><th>Time</th><th>Location</th><th>Attack orders (peak army)</th>"
+               "<th>Known targets</th></tr>")
+    for i, w in enumerate(battles, 1):
+        span = f"{fmt_t(w['start'])} – {fmt_t(w['end'])}"
+        loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else "—"
+        per = ", ".join(f"{p} {w['orders'][p]} ({w['peak_sel'].get(p, 0)})" for p in w["players"])
+        tg = ", ".join(f"{name} ×{n}" for name, n in w["targets"]) or "—"
+        out.append(f"<tr><td>{i}</td><td>{span}</td><td>{loc}</td>"
+                   f"<td>{esc(per) or '—'}</td><td>{esc(tg)}</td></tr>")
     out.append("</table></section>")
 
     # units trained (bars per player color; direct-labeled)
@@ -794,11 +1013,12 @@ def build_html(doc):
 
     out.append("</main>")
 
+    data_js = _page_data_js(players, events, doc["duration_ms"], colors)
     return ("<!doctype html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>{H.escape(map_disp)} {doc['recorded'][:10]}</title>"
             f"<style>{HTML_STYLE}</style></head><body>" + "".join(out)
-            + f"<script>{TOOLTIP_JS}</script></body></html>")
+            + f"<script>{TOOLTIP_JS}</script><script>{data_js}</script></body></html>")
 
 
 def format_report(path, game, players, cmds, protos, techs):
@@ -947,12 +1167,13 @@ def main():
     game, players = parse_settings(data)
     protos, techs = build_name_tables(data)
     cmds = parse_commands(data)
+    objects = parse_start_objects(data, protos)
     stem = file_stem(path, game)
 
     def resolve(arg, ext):
         return f"{stem}.{ext}" if arg == "auto" else arg
 
-    doc = build_events(path, game, players, cmds, protos, techs)
+    doc = build_events(path, game, players, cmds, protos, techs, objects)
     wrote_any = False
     if args.json:
         target = resolve(args.json, "json")
