@@ -1,0 +1,5 @@
+# generated per-game outputs (contain player names and chat)
+aoe3_*.json
+aoe3_*.txt
+aoe3_*.html
+__pycache__/
