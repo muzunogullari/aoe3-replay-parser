@@ -202,28 +202,53 @@ def build_name_tables(data):
             continue
         root = elements[0] if elements else ""
         if root == "proto":
-            state = {"cur": None}
+            state = {"cur": None, "act": None}
 
             def visit(elem, a, text, depth):
+                def num(default=0.0):
+                    try:
+                        return float(text)
+                    except ValueError:
+                        return default
                 if elem == "unit" and "id" in a and "name" in a:
                     try:
                         pid = int(a["id"])
                     except ValueError:
                         return False
                     protos[pid] = a["name"]
-                    state["cur"] = unit_info.setdefault(pid, {"cost": {}, "batch": 1})
+                    state["cur"] = unit_info.setdefault(
+                        pid, {"cost": {}, "batch": 1, "hp": 0.0, "initres": 0.0,
+                              "actions": []})
+                    state["act"] = None
                     return True
-                if depth == 2 and state["cur"] is not None:
+                cu = state["cur"]
+                if cu is None:
+                    return depth == 0
+                if depth == 2:
                     if elem == "cost" and "resourcetype" in a:
-                        try:
-                            state["cur"]["cost"][a["resourcetype"]] = float(text)
-                        except ValueError:
-                            pass
+                        cu["cost"][a["resourcetype"]] = num()
                     elif elem == "trainbatchsize":
-                        try:
-                            state["cur"]["batch"] = max(1, int(float(text)))
-                        except ValueError:
-                            pass
+                        cu["batch"] = max(1, int(num(1)))
+                    elif elem == "maxhitpoints":
+                        cu["hp"] = num()
+                    elif elem == "initialresource":
+                        cu["initres"] = num()
+                    elif elem == "protoaction":
+                        state["act"] = {"name": None, "damage": 0.0, "rof": 0.0,
+                                        "rates": {}}
+                        cu["actions"].append(state["act"])
+                        return True
+                    return False
+                if depth == 3 and state["act"] is not None:
+                    act = state["act"]
+                    if elem == "name":
+                        act["name"] = text
+                    elif elem == "damage":
+                        act["damage"] = num()
+                    elif elem == "rof":
+                        act["rof"] = num()
+                    elif elem == "rate" and "type" in a:
+                        act["rates"][a["type"]] = num()
                 return depth == 0
         elif root == "techtree":
             tstate = {"cur": None}
@@ -231,15 +256,31 @@ def build_name_tables(data):
             def visit(elem, a, text, depth):
                 if elem == "tech" and depth == 1:
                     techs.append(a.get("name") or "?")
-                    tstate["cur"] = {}
+                    tstate["cur"] = {"cost": {}, "gather": [], "combat": []}
                     tech_costs.append(tstate["cur"])
                     return True
-                if depth == 2 and tstate["cur"] is not None:
+                cu = tstate["cur"]
+                if cu is None:
+                    return depth == 0
+                if depth == 2:
                     if elem == "cost" and "resourcetype" in a:
                         try:
-                            tstate["cur"][a["resourcetype"]] = float(text)
+                            cu["cost"][a["resourcetype"]] = float(text)
                         except ValueError:
                             pass
+                    elif elem == "effects":
+                        return True
+                    return False
+                if depth == 3 and elem == "effect" and a.get("type") == "Data":
+                    try:
+                        amt = float(a.get("amount", "1"))
+                    except ValueError:
+                        return False
+                    sub = a.get("subtype")
+                    if sub == "WorkRate" and a.get("action") == "Gather":
+                        cu["gather"].append((a.get("unittype", ""), amt))
+                    elif sub in ("Damage", "Hitpoints"):
+                        cu["combat"].append((sub, a.get("unittype", ""), amt))
                 return depth == 0
         else:
             continue
@@ -250,6 +291,17 @@ def build_name_tables(data):
             pass
         if protos and techs:
             break
+    for info in unit_info.values():
+        dps, gather = 0.0, {}
+        for act in info.pop("actions", []):
+            if (act["damage"] > 0 and act["rof"] > 0
+                    and act["name"] not in ("Build", "ChopAttack", "BuildingAttack",
+                                            "HandAttackCrate", "SpearAttack")):
+                dps = max(dps, act["damage"] / act["rof"])
+            if act["name"] == "Gather":
+                gather.update(act["rates"])
+        info["dps"] = round(dps, 2)
+        info["gather"] = gather
     return protos, techs, unit_info, tech_costs
 
 
@@ -490,8 +542,8 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         e = {"t_ms": c["t"], "type": "research",
              "player_id": c["p"], "player": player_of(c["p"]),
              "tech": tech, "tech_id": c["tech"]}
-        if 0 <= c["tech"] < len(tech_costs) and tech_costs[c["tech"]]:
-            e["cost"] = {r: round(v) for r, v in tech_costs[c["tech"]].items()}
+        if 0 <= c["tech"] < len(tech_costs) and tech_costs[c["tech"]]["cost"]:
+            e["cost"] = {r: round(v) for r, v in tech_costs[c["tech"]]["cost"].items()}
         events.append(e)
     for c in cmds["shipments"]:
         events.append({"t_ms": c["t"], "type": "shipment",
@@ -505,14 +557,45 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         e["t"] = fmt_t(e["t_ms"])
 
     start_objects = []
+    start_res = Counter()
+    start_vills = Counter()
     for inst, (pid, owner, x, z) in objects.items():
         nm = protos.get(pid, "")
-        if 1 <= owner <= 12 and x is not None and not re.search(r"Crate|Flag", nm):
+        if not (1 <= owner <= 12):
+            continue
+        if "Crate" in nm:
+            start_res[owner] += round(unit_info.get(pid, {}).get("initres", 0))
+            continue
+        if nm == "Coureur" or nm.startswith("Settler") or "Villager" in nm:
+            start_vills[owner] += 1
+        if x is not None and not re.search(r"Flag", nm):
             start_objects.append({"player_id": owner, "unit": nm,
                                   "x": round(x, 1), "z": round(z, 1)})
+    for pid in start_vills:
+        start_res[pid] += STANDARD_START_RES
+
     resigned = {r["slot"] for r in cmds["resigns"]}
+    plist = [{"id": pid, "name": p.get("name"), "civ": p.get("civname")}
+             for pid, p in sorted(players.items())]
+    name_stats = {protos[pid]: info for pid, info in unit_info.items()
+                  if pid in protos}
+    battles = find_battles(events, cmds["duration"])
+    battle_power(plist, events, battles, name_stats, tech_costs)
+    estimates = estimate_economy(plist, events, tech_costs, start_res,
+                                 start_vills, cmds["duration"])
+    battles_json = [
+        {"n": i + 1, "start_ms": w["start"], "end_ms": w["end"],
+         "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
+         "attack_orders": w["orders"], "peak_army": w["peak_sel"],
+         "loc": w["loc"], "targets_hit": w["targets"],
+         "power_estimate": w["power"]}
+        for i, w in enumerate(battles)]
     return {
         "start_objects": start_objects,
+        "start_resources_estimate": dict(start_res),
+        "battles": battles_json,
+        "economy_estimate_10s": {str(k): v for k, v in estimates.items()},
+        "_battles_internal": battles,
         "replay": path,
         "recorded": datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(),
         "duration_ms": cmds["duration"],
@@ -550,6 +633,101 @@ def file_stem(path, game):
 
 
 BUCKET_MS = 10_000
+
+# blended villager gather rate (res/sec) across food/wood/coin tasks, from
+# protoy Gather rates (hunt .84, mill .67, mine .60, tree .50, estate .50)
+BASE_GATHER = 0.6
+STANDARD_START_RES = 600  # approximate combined starting stockpile
+
+
+def estimate_economy(players, events, tech_info, start_res, start_vills,
+                     duration_ms):
+    """Model estimate: villagers x blended gather rate x researched gather
+    multipliers, integrated over time; stockpile = start + gathered - spent.
+    Spend is exact; income is a first-order model."""
+    est = {}
+    for p in players:
+        pid = p["id"]
+        vill_times = []
+        tc_times = []
+        spend = []
+        research = []
+        for e in events:
+            if e.get("player_id") != pid:
+                continue
+            if e["type"] == "train" and (e["unit"] == "Coureur"
+                                         or e["unit"].startswith("Settler")):
+                vill_times.append(e["t_ms"])
+            elif e["type"] == "build" and e["building"] == "TownCenter":
+                tc_times.append(e["t_ms"])
+            if e.get("cost"):
+                spend.append((e["t_ms"], sum(e["cost"].values())))
+            if e["type"] == "research":
+                research.append((e["t_ms"], e["tech_id"]))
+        spend.sort()
+        rows = []
+        gathered = 0.0
+        vi = si = ri = 0
+        spent = 0
+        blend = 0.0
+        auto = p["civ"] == "Ottomans"
+        for t in range(0, duration_ms + 1, BUCKET_MS):
+            while vi < len(vill_times) and vill_times[vi] <= t:
+                vi += 1
+            while si < len(spend) and spend[si][0] <= t:
+                spent += spend[si][1]
+                si += 1
+            while ri < len(research) and research[ri][0] <= t:
+                tid = research[ri][1]
+                if 0 <= tid < len(tech_info):
+                    for _ut, amt in tech_info[tid]["gather"]:
+                        blend += (amt - 1) / 3
+                ri += 1
+            if auto:
+                ntc = 1 + sum(1 for x in tc_times if x <= t)
+                vills = min(99, start_vills.get(pid, 6) + int(t / 30000 * ntc))
+            else:
+                vills = start_vills.get(pid, 0) + vi
+            gathered += vills * BASE_GATHER * (1 + blend) * (BUCKET_MS / 1000)
+            stock = max(0, round(start_res.get(pid, 0) + gathered - spent))
+            rows.append([t, vills, round(gathered), stock])
+        est[pid] = rows
+    return est
+
+
+def battle_power(players, events, battles, name_stats, tech_info):
+    """Per battle/player: observed peak army size x average unit strength of
+    the military mix trained by then (hp x dps, with researched Damage /
+    Hitpoints upgrades applied). Model estimate."""
+    for w in battles:
+        w["power"] = {}
+        for p in players:
+            comp = Counter()
+            mult = defaultdict(lambda: {"Damage": 0.0, "Hitpoints": 0.0})
+            for e in events:
+                if e.get("player_id") != p["id"] or e["t_ms"] >= w["start"]:
+                    continue
+                if e["type"] == "train":
+                    st = name_stats.get(e["unit"])
+                    if st and st["dps"] > 0:
+                        comp[e["unit"]] += e.get("count", 1)
+                elif e["type"] == "research" and 0 <= e["tech_id"] < len(tech_info):
+                    for sub, ut, amt in tech_info[e["tech_id"]]["combat"]:
+                        mult[ut][sub] += amt - 1
+            total_n = sum(comp.values())
+            if not total_n:
+                continue
+            tot = 0.0
+            for unit, n in comp.items():
+                st = name_stats[unit]
+                dmg = 1 + mult[unit]["Damage"]
+                hp = 1 + mult[unit]["Hitpoints"]
+                tot += n * (st["hp"] * hp) * (st["dps"] * dmg) / 100
+            avg = tot / total_n
+            army = w["peak_sel"].get(p["name"], 0)
+            if army:
+                w["power"][p["name"]] = round(army * avg)
+    return battles
 
 
 def find_battles(events, duration_ms):
@@ -1145,7 +1323,8 @@ def build_html(doc):
 
     def vills_at(pid, t):
         if autovill.get(pid):
-            return "auto"
+            r = est_row(pid, t)
+            return f"~{r[1]}" if r else "auto"
         return start_vills[pid] + bisect_right(vill_t[pid], t)
 
     def mil_at(pid, t):
@@ -1163,8 +1342,15 @@ def build_html(doc):
                        f'<span style="color:var(--muted)">{fmt_k(spent_at(p["id"], t))} spent</span></td>'
                        for p in players)
 
-    battles = find_battles(events, doc["duration_ms"])
+    battles = doc["_battles_internal"]
+    est = doc["economy_estimate_10s"]
     tip_label = {p["id"]: p["name"] for p in players}
+
+    def est_row(pid, t):
+        rows = est.get(str(pid)) or est.get(pid)
+        if not rows:
+            return None
+        return rows[min(t // BUCKET_MS, len(rows) - 1)]
 
     # timeline: age-ups, shipments, battles, resigns on one axis
     out.append('<h2>Timeline</h2><section class="chart">')
@@ -1213,6 +1399,13 @@ def build_html(doc):
     out.append('<h2>Economy (resources spent on units, buildings and research, cumulative)</h2>'
                '<section class="chart">')
     out.append(_step_chart(sp_t, doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+    stock_series = {p["id"]: [(r[0], r[3]) for r in
+                              (est.get(str(p["id"])) or est.get(p["id"]) or [])]
+                    for p in players}
+    out.append('<h2>Economy (estimated stockpile — modeled income minus exact spend)</h2>'
+               '<section class="chart">')
+    out.append(_step_chart(stock_series, doc["duration_ms"], colors, tip_label))
     out.append("</section>")
     out.append("<h2>Resources Spent (totals)</h2><section><table>")
     res_cols = ["Food", "Wood", "Gold"]
@@ -1337,9 +1530,11 @@ def build_html(doc):
             for p in side:
                 n = w["orders"].get(p["name"], 0)
                 army = w["peak_sel"].get(p["name"], 0)
+                pw_ = w.get("power", {}).get(p["name"])
                 if n or army:
                     parts.append(f'{chip(p["id"])}{esc(p["name"])} '
-                                 f'<span class="num">{n} orders, army {army}</span>')
+                                 f'<span class="num">{n} orders, army {army}'
+                                 f'{", power ~" + fmt_k(pw_) if pw_ else ""}</span>')
             out.append(f'<div class="bside">{" &nbsp; ".join(parts) if parts else "—"}</div>')
         state = " &nbsp; ".join(f'{chip(p["id"])}<span class="num">'
                                 f'{vills_at(p["id"], w["start"])} v · '
@@ -1525,7 +1720,8 @@ def main():
     if args.json:
         target = resolve(args.json, "json")
         with open(target, "w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=1, ensure_ascii=False)
+            json.dump({k: v for k, v in doc.items() if not k.startswith("_")},
+                      f, indent=1, ensure_ascii=False)
         print(f"Wrote {target}: {doc['event_count']} events, duration {doc['duration']}")
         wrote_any = True
     if args.output:

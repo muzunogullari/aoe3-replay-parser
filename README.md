@@ -49,16 +49,32 @@ of every attack order and hit, sides, per-player orders and army size, and
 each player's villagers/military/spend at battle start). Light/dark follows
 the OS.
 
-### Spend reconstruction (simulation data from the game files)
+### Simulation engines (built on the game's own data)
 
 The replay embeds the runtime `protoy.xml`/`techtreey.xml`, which carry the
-actual simulation data: unit/building costs, train batch sizes and tech
-costs. Every train/build/research event in the JSON is annotated with its
-exact cost, and the report reconstructs cumulative resources spent per
-player — this is derived from game data plus the deterministic command
-stream, not estimated. Resource *stockpiles* and income would additionally
-require gather-rate simulation of villager task assignments, and combat
-outcomes depend on engine targeting/pathfinding, so neither is reproduced.
+actual simulation data: unit/building costs, train batch sizes, tech costs,
+villager gather rates, unit hit points, damage and rate of fire, crate
+contents, and tech effects (gather work-rate and Damage/Hitpoints
+modifiers). On top of the deterministic command stream the parser runs:
+
+- **Spend reconstruction (exact):** every train/build/research event is
+  annotated with its real cost; cumulative resources spent per player is
+  derived, not estimated.
+- **Economy engine (model estimate):** villager count × blended gather rate
+  (from protoy) × researched gather multipliers, integrated per 10s;
+  estimated stockpile = starting resources + crates + modeled income −
+  exact spend. Ottoman auto-spawned villagers are modeled from Town Center
+  count. Exposed as `economy_estimate_10s` in the JSON and as the estimated
+  stockpile chart.
+- **Combat power engine (model estimate):** per battle and player, observed
+  peak army size × average unit strength (hp × dps from protoy, with
+  researched Veteran/Guard-style Damage/Hitpoints upgrades applied).
+  Exposed as `power_estimate` in the JSON `battles` list and on battle
+  cards.
+
+The hard boundary remains: actual combat outcomes (kills, deaths) depend on
+engine targeting and pathfinding and cannot be faithfully reproduced from
+orders — power numbers are strength-on-paper, not results.
 
 ### Combat data: what a replay can and cannot tell you
 
