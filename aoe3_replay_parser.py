@@ -899,6 +899,19 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             else:
                 break
         return n
+
+    mil_type_events = defaultdict(lambda: defaultdict(list))  # pid -> unit -> [(t, n)]
+    for e in events:
+        if e["type"] == "train" and not (e["unit"] == "Coureur"
+                                         or e["unit"].startswith("Settler")
+                                         or e["unit"].startswith("Fishing")):
+            mil_type_events[e["player_id"]][e["unit"]].append(
+                (e["t_ms"], e.get("count", 1)))
+
+    def mil_types_at(pid, t):
+        return {u: sum(n for tt, n in lst if tt <= t)
+                for u, lst in mil_type_events[pid].items()
+                if any(tt <= t for tt, _ in lst)}
     name_stats = {protos[pid]: info for pid, info in unit_info.items()
                   if pid in protos}
     battles = find_battles(events, cmds["duration"])
@@ -931,6 +944,25 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                         reinf[e["unit"]] += e.get("count", 1)
                     elif w["end"] <= e["t_ms"] < w["end"] + 120_000:
                         repl[e["unit"]] += e.get("count", 1)
+            # Before / made / lost / after per unit type. Lost total is the
+            # not-seen-again id count, allocated across types by army mix.
+            before = mil_types_at(pid, w["start"])
+            made = {u: n for u, n in reinf.items()
+                    if u in mil_type_events[pid] or not u.startswith(("Settler", "Coureur", "Fishing"))}
+            lost_total = 0 if endgame else min(lost, sum(before.values()) + sum(made.values()))
+            pool = {u: before.get(u, 0) + made.get(u, 0)
+                    for u in set(before) | set(made)}
+            pool_sum = sum(pool.values())
+            table = []
+            remaining = lost_total
+            for u, have in sorted(pool.items(), key=lambda kv: -kv[1]):
+                li = min(have, round(lost_total * have / pool_sum)) if pool_sum else 0
+                li = min(li, remaining)
+                remaining -= li
+                table.append({"unit": u, "before": before.get(u, 0),
+                              "made": made.get(u, 0), "lost": li,
+                              "after": before.get(u, 0) + made.get(u, 0) - li})
+            table.sort(key=lambda r: -r["after"])
             w["units"][p["name"]] = {
                 "involved": len(involved),
                 "known_types": dict(typed.most_common(4)),
@@ -939,6 +971,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                 "military_trained_total": mil_total_at(pid, w["start"]),
                 "reinforced_during": dict(reinf.most_common(6)),
                 "queued_after": dict(repl.most_common(6)),
+                "table": table,
             }
     estimates = estimate_economy(plist, events, tech_costs, start_res,
                                  start_vills, cmds["duration"])
@@ -1200,8 +1233,8 @@ tr:last-child td { border-bottom: none; }
 .bcards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 720px) { .bcards { grid-template-columns: 1fr; } }
 .bcard { background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; padding: 12px 14px; display: flex; gap: 12px; }
-.bcard svg { width: 96px; height: 96px; flex: none; }
+  border-radius: 8px; padding: 14px 16px; }
+.bcard > svg { width: 100%; height: auto; margin-bottom: 10px; }
 .bhead { font-weight: 600; }
 .bmeta { color: var(--muted); font-size: 13px; margin-bottom: 6px;
   font-variant-numeric: tabular-nums; }
@@ -1639,7 +1672,7 @@ def build_html(doc):
         out.append(f'<div class="meta won">Winners: {esc(", ".join(winners))}</div>')
 
     # players
-    out.append('<details class="grp" open><summary>Players &amp; Timeline</summary>')
+    out.append('<details class="grp"><summary>Players &amp; Timeline</summary>')
     out.append("<h2>Players</h2><section><table>")
     out.append("<tr><th>Player</th><th>Civ</th><th>Team</th><th>Home City</th><th>Result</th></tr>")
     resign_t = {e["player_id"]: e["t"] for e in events if e["type"] == "resign"}
@@ -1730,7 +1763,7 @@ def build_html(doc):
     out.append('<h2>Timeline</h2><section class="chart">')
     out.append(_timeline_chart(players, events, battles, doc["duration_ms"], colors))
     out.append("</section></details>")
-    out.append('<details class="grp" open><summary>Aging</summary>')
+    out.append('<details class="grp"><summary>Aging</summary>')
 
     # aging: per age-up event, everyone's villager / military-trained state
     age_events = []
@@ -1917,7 +1950,7 @@ def build_html(doc):
     out.append("</table></section>")
 
     # activity histogram with brush selection
-    out.append('</details><details class="grp" open><summary>Battle Analysis</summary>')
+    out.append('</details><details class="grp"><summary>Battle Analysis</summary>')
     out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
                '<section class="chart">')
     out.append(_activity_chart(players, events, doc["duration_ms"], colors))
@@ -1927,7 +1960,7 @@ def build_html(doc):
 
     # map: brushed-range activity over map coordinates
     out.append('<h2>Map (selection)</h2>'
-               '<section class="chart" style="max-width:540px;margin:0 auto">')
+               '<section class="chart" style="max-width:780px;margin:0 auto">')
     out.append(_map_svg(doc, battles, colors))
     out.append('<div class="num" style="font-size:12px;margin-top:6px">'
                '&#9633; start building &nbsp; &#9632; building placed &nbsp; '
@@ -1937,14 +1970,14 @@ def build_html(doc):
     # battles
     mapsz = _map_size(doc)
     sides = _sides(players)
-    out.append('</details><details class="grp" open><summary>Battles</summary>')
+    out.append('</details><details class="grp"><summary>Battles</summary>')
     out.append('<div class="bcards">')
     for i, w in enumerate(battles, 1):
         loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
         total = w["count"]
         out.append('<div class="bcard">')
         out.append(_battle_minimap(doc, w, colors, mapsz, events))
-        out.append('<div style="flex:1">')
+        out.append("<div>")
         out.append(f'<div class="bhead">Battle {i}</div>')
         out.append(f'<div class="bmeta">{fmt_t(w["start"])} – {fmt_t(w["end"])}'
                    f'{" · " + loc if loc else ""} · {total} attack orders</div>')
@@ -1973,25 +2006,27 @@ def build_html(doc):
                            f'(ransom {e["amount"]} coin → {esc(e["paid_to"])})</div>')
         if w.get("units"):
             out.append('<details class="deck"><summary class="bt">Unit breakdown</summary>')
-            out.append('<table style="font-size:12.5px"><tr><th>Player</th>'
-                       '<th>Committed</th><th>Of military</th><th>Not seen after</th>'
-                       '<th>Seen after</th><th>Reinforced during</th>'
-                       '<th>Queued after (loss signal)</th></tr>')
+            out.append('<table style="font-size:12.5px"><tr><th>Player</th><th>Unit</th>'
+                       '<th>Before</th><th>Made during</th><th>Lost</th><th>After</th></tr>')
             for p in players:
                 u = w["units"].get(p["name"])
-                if not u:
+                if not u or not u.get("table"):
                     continue
-                types = ", ".join(f"{t} ×{n}" for t, n in u["known_types"].items())
-                inv = f'{u["involved"]}' + (f' ({types})' if types else "")
-                nsa = "n/a" if u["not_seen_after"] is None else u["not_seen_after"]
-                sa = "n/a" if u["seen_after"] is None else u["seen_after"]
-                ri = ", ".join(f"{t} ×{n}" for t, n in u["reinforced_during"].items()) or "—"
-                qa = ", ".join(f"{t} ×{n}" for t, n in u["queued_after"].items()) or "—"
-                out.append(f'<tr><td>{chip(p["id"])}{esc(p["name"])}</td>'
-                           f'<td class="num">{inv}</td>'
-                           f'<td class="num">{u["military_trained_total"]}</td>'
-                           f'<td class="num">{nsa}</td><td class="num">{sa}</td>'
-                           f'<td>{esc(ri)}</td><td>{esc(qa)}</td></tr>')
+                rows = u["table"]
+                tb = sum(r["before"] for r in rows)
+                tm = sum(r["made"] for r in rows)
+                tl = sum(r["lost"] for r in rows)
+                ta = sum(r["after"] for r in rows)
+                for j, r in enumerate(rows):
+                    name_cell = f'{chip(p["id"])}{esc(p["name"])}' if j == 0 else ""
+                    out.append(f'<tr><td>{name_cell}</td><td>{esc(r["unit"])}</td>'
+                               f'<td class="num">{r["before"]}</td>'
+                               f'<td class="num">{r["made"] or "—"}</td>'
+                               f'<td class="num">{r["lost"] or "—"}</td>'
+                               f'<td class="num">{r["after"]}</td></tr>')
+                out.append(f'<tr><td></td><td class="won">Total</td>'
+                           f'<td class="num won">{tb}</td><td class="num won">{tm or "—"}</td>'
+                           f'<td class="num won">{tl or "—"}</td><td class="num won">{ta}</td></tr>')
             out.append("</table></details>")
         out.append("</div></div>")
     out.append("</div></details>")
