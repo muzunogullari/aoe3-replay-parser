@@ -2122,6 +2122,14 @@ def build_html(doc):
     out.append('<h2>Economy (villager production, cumulative)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
     out.append("</section>")
+    vill_series = {p["id"]: [(r[0], r[1]) for i, r in
+                             enumerate(est.get(str(p["id"])) or est.get(p["id"]) or [])
+                             if i % 3 == 0]
+                   for p in players}
+    out.append('<h2>Villagers Alive (estimated, deaths and caps applied)</h2>'
+               '<section class="chart">')
+    out.append(_step_chart(vill_series, doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
     out.append('<h2>Economy (resources spent on units, buildings and research, cumulative)</h2>'
                '<section class="chart">')
     out.append(_step_chart(sp_t, doc["duration_ms"], colors, tip_label))
@@ -2200,6 +2208,40 @@ def build_html(doc):
     out.append('</details><details class="grp"><summary>⚔︎ Military</summary>')
     out.append('<h2>Military (production, cumulative train commands)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+
+    # alive army size and cumulative losses over time, from the loss model
+    mdeaths = {p["id"]: sorted(t for t, k in loss_ev.get(p["id"], [])
+                               if k == "military") for p in players}
+    alive_series, loss_series = {}, {}
+    for p in players:
+        pid = p["id"]
+        deltas = []
+        for e in events:
+            if e["type"] == "train" and e["player_id"] == pid and is_military(e["unit"]):
+                deltas.append((e["t_ms"], e.get("count", 1)))
+            elif (e["type"] == "shipment" and e["player_id"] == pid
+                  and e.get("units_delivered")):
+                deltas.append((e["t_ms"] + 40_000,
+                               sum(e["units_delivered"].values())))
+        deltas.extend((t, -1) for t in mdeaths[pid])
+        deltas.sort()
+        run = 0
+        pts, lpts, lost = [], [], 0
+        for t, d in deltas:
+            run += d
+            pts.append((t, max(0, run)))
+            if d < 0:
+                lost += 1
+                lpts.append((t, lost))
+        alive_series[pid] = pts
+        loss_series[pid] = lpts
+    out.append('<h2>Army Size Over Time (alive military, estimated)</h2>'
+               '<section class="chart">')
+    out.append(_step_chart(alive_series, doc["duration_ms"], colors, tip_label))
+    out.append("</section>")
+    out.append('<h2>Cumulative Military Losses (estimated)</h2><section class="chart">')
+    out.append(_step_chart(loss_series, doc["duration_ms"], colors, tip_label))
     out.append("</section>")
     trains = defaultdict(Counter)
     for e in events:
