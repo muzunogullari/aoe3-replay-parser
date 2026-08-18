@@ -231,6 +231,10 @@ def build_name_tables(data):
                         cu["batch"] = max(1, int(num(1)))
                     elif elem == "maxhitpoints":
                         cu["hp"] = num()
+                    elif elem == "trainpoints":
+                        cu["trainpoints"] = num()
+                    elif elem == "buildlimit":
+                        cu["buildlimit"] = int(num(0))
                     elif elem == "initialresource":
                         cu["initres"] = num()
                     elif elem == "protoaction":
@@ -251,13 +255,14 @@ def build_name_tables(data):
                         act["rates"][a["type"]] = num()
                 return depth == 0
         elif root == "techtree":
-            tstate = {"cur": None}
+            tstate = {"cur": None, "pend": None}
 
             def visit(elem, a, text, depth):
                 if elem == "tech" and depth == 1:
                     techs.append(a.get("name") or "?")
                     tstate["cur"] = {"cost": {}, "gather": [], "combat": [],
-                                     "units": []}
+                                     "units": [], "settler_mods": []}
+                    tstate["pend"] = None
                     tech_costs.append(tstate["cur"])
                     return True
                 cu = tstate["cur"]
@@ -284,6 +289,14 @@ def build_name_tables(data):
                         cu["combat"].append((sub, a.get("unittype", ""), amt))
                     elif sub == "FreeHomeCityUnit":
                         cu["units"].append((a.get("unittype", ""), int(amt)))
+                    elif sub in ("TrainPoints", "BuildLimit"):
+                        tstate["pend"] = (sub, amt)
+                        return True
+                    return False
+                if depth == 4 and elem == "target" and tstate["pend"]:
+                    if "Settler" in text or "Villager" in text or "Coureur" in text:
+                        cu["settler_mods"].append(tstate["pend"])
+                    tstate["pend"] = None
                 return depth == 0
         else:
             continue
@@ -1169,7 +1182,8 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     estimates = estimate_economy(plist, events, tech_costs, start_res,
                                  start_vills, cmds["duration"],
                                  vill_deaths=vill_deaths,
-                                 extra_income=dict(extra_income))
+                                 extra_income=dict(extra_income),
+                                 vill_stats=name_stats)
     battles_json = [
         {"n": i + 1, "start_ms": w["start"], "end_ms": w["end"],
          "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
@@ -1235,29 +1249,63 @@ BASE_GATHER = 0.6
 STANDARD_START_RES = 600  # approximate combined starting stockpile
 
 
+# which gather-effect unit types feed which income stream
+GATHER_CLASS = {"Huntable": "hunt", "AbstractBerryBush": "hunt",
+                "Mill": "mill", "Farm": "mill", "deField": "mill",
+                "Tree": "tree", "ypGroveBuilding": "tree",
+                "AbstractMine": "mine", "AbstractMountainMonastery": "mine",
+                "Plantation": "plant", "ypRicePaddy": "plant",
+                "deHacienda": "plant"}
+# macro allocation of villagers across food/wood/coin, and time actually
+# spent gathering (walking/idle/building discount)
+FOOD_SHARE, WOOD_SHARE, COIN_SHARE, UTILIZATION = 0.45, 0.25, 0.30, 0.9
+# auto-spawned Ottoman settlers: classic base cap of 25 (raised by Galata /
+# Topkapi BuildLimit effects) and a spawn-pacing factor on Settler trainpoints
+OTTOMAN_BASE_CAP = 25
+OTTOMAN_SPAWN_FACTOR = 1.6
+
+
 def estimate_economy(players, events, tech_info, start_res, start_vills,
-                     duration_ms, vill_deaths=None, extra_income=None):
-    """Model estimate: alive villagers x blended gather rate x researched
-    gather multipliers, integrated over time; stockpile = start + gathered
-    + crate shipments + tribute net - spent. Spend is exact; income is a
-    first-order model."""
+                     duration_ms, vill_deaths=None, extra_income=None,
+                     vill_stats=None):
+    """Income model built from the game's own numbers: the civ villager's
+    per-task gather rates (protoy), researched gather multipliers applied to
+    their matching task, mills/plantations switching food/coin tasks off
+    hunts/mines, and Ottoman auto-spawn driven by Settler trainpoints,
+    church TrainPoints/BuildLimit effects and Town Center count.
+    Stockpile = start + gathered + crates + tribute net - exact spend."""
     vill_deaths = vill_deaths or {}
     extra_income = extra_income or {}
+    vill_stats = vill_stats or {}
     est = {}
     for p in players:
         pid = p["id"]
-        vill_times = []
-        tc_times = []
-        spend = []
-        research = []
+        vp = "Coureur" if p["civ"] == "French" else "Settler"
+        st = vill_stats.get(vp, {})
+        g = st.get("gather", {})
+        r_hunt = g.get("Huntable", 0.84)
+        r_mill = g.get("Mill", 0.67)
+        r_tree = g.get("Tree", 0.50)
+        r_mine = g.get("AbstractMine", 0.60)
+        r_plant = g.get("Plantation", 0.50)
+        auto = p["civ"] == "Ottomans"
+        cap_base = OTTOMAN_BASE_CAP if auto else (st.get("buildlimit") or 99)
+        tp_base = st.get("trainpoints") or 25.0
+
+        vill_times, tc_times, mills, plants, spend, research = [], [], [], [], [], []
         for e in events:
             if e.get("player_id") != pid:
                 continue
             if e["type"] == "train" and (e["unit"] == "Coureur"
                                          or e["unit"].startswith("Settler")):
                 vill_times.append(e["t_ms"])
-            elif e["type"] == "build" and e["building"] == "TownCenter":
-                tc_times.append(e["t_ms"])
+            elif e["type"] == "build":
+                if e["building"] == "TownCenter":
+                    tc_times.append(e["t_ms"])
+                elif e["building"] in ("Mill", "Farm", "deField", "ypRicePaddy"):
+                    mills.append(e["t_ms"])
+                elif e["building"] in ("Plantation", "deHacienda", "Estate"):
+                    plants.append(e["t_ms"])
             if e.get("cost"):
                 spend.append((e["t_ms"], sum(e["cost"].values())))
             if e["type"] == "research":
@@ -1265,13 +1313,15 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
         spend.sort()
         vdead = sorted(vill_deaths.get(pid, []))
         extra = sorted(extra_income.get(pid, []))
+
         rows = []
         gathered = 0.0
         vi = si = ri = di = xi = 0
-        spent = 0
-        bonus = 0
-        blend = 0.0
-        auto = p["civ"] == "Ottomans"
+        spent = bonus = 0
+        b = {"hunt": 0.0, "mill": 0.0, "tree": 0.0, "mine": 0.0, "plant": 0.0}
+        cap = cap_base
+        tp = tp_base
+        auto_v = float(start_vills.get(pid, 6))
         for t in range(0, duration_ms + 1, BUCKET_MS):
             while vi < len(vill_times) and vill_times[vi] <= t:
                 vi += 1
@@ -1286,16 +1336,33 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
             while ri < len(research) and research[ri][0] <= t:
                 tid = research[ri][1]
                 if 0 <= tid < len(tech_info):
-                    for _ut, amt in tech_info[tid]["gather"]:
-                        blend += (amt - 1) / 3
+                    for ut, amt in tech_info[tid]["gather"]:
+                        cls = GATHER_CLASS.get(ut)
+                        if cls:
+                            b[cls] += amt - 1
+                    for sub, amt in tech_info[tid].get("settler_mods", []):
+                        if sub == "TrainPoints":
+                            tp = max(6.0, tp + amt)
+                        elif sub == "BuildLimit":
+                            cap += int(amt)
                 ri += 1
             if auto:
                 ntc = 1 + sum(1 for x in tc_times if x <= t)
-                vills = min(99, start_vills.get(pid, 6) + int(t / 30000 * ntc))
+                auto_v += ntc * (BUCKET_MS / 1000) / (tp * OTTOMAN_SPAWN_FACTOR)
+                vills = int(min(cap, auto_v))
             else:
-                vills = start_vills.get(pid, 0) + vi
+                vills = min(cap, start_vills.get(pid, 0) + vi)
             vills = max(0, vills - di)
-            gathered += vills * BASE_GATHER * (1 + blend) * (BUCKET_MS / 1000)
+            food_r = (r_mill * (1 + b["mill"])
+                      if any(mt <= t - 60_000 for mt in mills)
+                      else r_hunt * (1 + b["hunt"]))
+            coin_r = (r_plant * (1 + b["plant"])
+                      if any(pt <= t - 60_000 for pt in plants)
+                      else r_mine * (1 + b["mine"]))
+            rate = UTILIZATION * (FOOD_SHARE * food_r
+                                  + WOOD_SHARE * r_tree * (1 + b["tree"])
+                                  + COIN_SHARE * coin_r)
+            gathered += vills * rate * (BUCKET_MS / 1000)
             stock = max(0, round(start_res.get(pid, 0) + gathered + bonus - spent))
             rows.append([t, vills, round(gathered), stock])
         est[pid] = rows

@@ -62,12 +62,18 @@ modifiers). On top of the deterministic command stream the parser runs:
 - **Spend reconstruction (exact):** every train/build/research event is
   annotated with its real cost; cumulative resources spent per player is
   derived, not estimated.
-- **Economy engine (model estimate):** villager count × blended gather rate
-  (from protoy) × researched gather multipliers, integrated per 10s;
-  estimated stockpile = starting resources + crates + modeled income −
-  exact spend. Ottoman auto-spawned villagers are modeled from Town Center
-  count. Exposed as `economy_estimate_10s` in the JSON and as the estimated
-  stockpile chart.
+- **Economy engine (model estimate):** income is built from the game's own
+  numbers — the civ villager's per-task gather rates from protoy (hunt
+  0.84/s, mill 0.67, tree 0.50, mine 0.60, estate 0.50), researched gather
+  techs applied to their matching task, mills/plantations switching
+  food/coin gathering off hunts/mines once built, villager build limits
+  (e.g. Coureur 80), and villager deaths reducing the workforce. Ottoman
+  auto-spawn uses Settler trainpoints with their church TrainPoints
+  effects (Millet −4s, Koprulu −6s) and BuildLimit effects (base cap 25,
+  Galata +20, Topkapi +25) per Town Center. Stockpile = start + crates +
+  tributes + income − exact spend. The macro food/wood/coin split and a
+  0.9 utilization factor are the remaining modeling assumptions. Exposed
+  as `economy_estimate_10s` in the JSON and the stockpile chart.
 - **Selected deck &amp; named shipments:** each player's deck library is
   parsed from the replay; the deck actually used is solved by testing every
   candidate against the game's send/arrival record, using the fact that the
