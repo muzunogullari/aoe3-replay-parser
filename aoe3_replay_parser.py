@@ -961,13 +961,21 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                                          or e["unit"].startswith("Fishing")):
             mil_type_events[e["player_id"]][e["unit"]].append(
                 (e["t_ms"], e.get("count", 1)))
-    # shipment cards that deliver units count toward the army too
+    # shipment cards that deliver units count toward the army too;
+    # crate cards count toward resources
     tech_ord = {name: i for i, name in enumerate(techs)}
+    name_initres = {protos[k]: v.get("initres", 0) for k, v in unit_info.items()
+                    if k in protos}
+    crate_gifts = defaultdict(list)  # pid -> [(t, resources)]
     for e in events:
         if e["type"] == "shipment" and e.get("card") in tech_ord:
             info = tech_costs[tech_ord[e["card"]]]
             delivered = {}
             for ut, n in info.get("units", []):
+                if "Crate" in ut and n > 0 and name_initres.get(ut):
+                    crate_gifts[e["player_id"]].append(
+                        (e["t_ms"] + 40_000, round(n * name_initres[ut])))
+                    continue
                 if (_vill_name(ut) or n <= 0
                         or re.search(r"Crate|Wagon|Flag|Covered|Sheep|Cow|Llama", ut)):
                     continue
@@ -1141,8 +1149,19 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     for p in plist:
         lt = loss_totals[p["id"]]
         lt["outside_battles"] = lt["military"] + lt["villagers"] - lt["in_battles"]
+    extra_income = defaultdict(list)
+    for pid2, gifts in crate_gifts.items():
+        extra_income[pid2].extend(gifts)
+    for c in cmds["tributes"]:
+        amt = round(c["amount"] * 0.9)  # tribute fee
+        extra_income[c["p"]].append((c["t"], -c["amount"]))
+        extra_income[c["to"]].append((c["t"], amt))
+    vill_deaths = {p["id"]: [t for t, k in deaths[p["id"]] if k == "villager"]
+                   for p in plist}
     estimates = estimate_economy(plist, events, tech_costs, start_res,
-                                 start_vills, cmds["duration"])
+                                 start_vills, cmds["duration"],
+                                 vill_deaths=vill_deaths,
+                                 extra_income=dict(extra_income))
     battles_json = [
         {"n": i + 1, "start_ms": w["start"], "end_ms": w["end"],
          "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
@@ -1209,10 +1228,13 @@ STANDARD_START_RES = 600  # approximate combined starting stockpile
 
 
 def estimate_economy(players, events, tech_info, start_res, start_vills,
-                     duration_ms):
-    """Model estimate: villagers x blended gather rate x researched gather
-    multipliers, integrated over time; stockpile = start + gathered - spent.
-    Spend is exact; income is a first-order model."""
+                     duration_ms, vill_deaths=None, extra_income=None):
+    """Model estimate: alive villagers x blended gather rate x researched
+    gather multipliers, integrated over time; stockpile = start + gathered
+    + crate shipments + tribute net - spent. Spend is exact; income is a
+    first-order model."""
+    vill_deaths = vill_deaths or {}
+    extra_income = extra_income or {}
     est = {}
     for p in players:
         pid = p["id"]
@@ -1233,10 +1255,13 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
             if e["type"] == "research":
                 research.append((e["t_ms"], e["tech_id"]))
         spend.sort()
+        vdead = sorted(vill_deaths.get(pid, []))
+        extra = sorted(extra_income.get(pid, []))
         rows = []
         gathered = 0.0
-        vi = si = ri = 0
+        vi = si = ri = di = xi = 0
         spent = 0
+        bonus = 0
         blend = 0.0
         auto = p["civ"] == "Ottomans"
         for t in range(0, duration_ms + 1, BUCKET_MS):
@@ -1245,6 +1270,11 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
             while si < len(spend) and spend[si][0] <= t:
                 spent += spend[si][1]
                 si += 1
+            while di < len(vdead) and vdead[di] <= t:
+                di += 1
+            while xi < len(extra) and extra[xi][0] <= t:
+                bonus += extra[xi][1]
+                xi += 1
             while ri < len(research) and research[ri][0] <= t:
                 tid = research[ri][1]
                 if 0 <= tid < len(tech_info):
@@ -1256,8 +1286,9 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
                 vills = min(99, start_vills.get(pid, 6) + int(t / 30000 * ntc))
             else:
                 vills = start_vills.get(pid, 0) + vi
+            vills = max(0, vills - di)
             gathered += vills * BASE_GATHER * (1 + blend) * (BUCKET_MS / 1000)
-            stock = max(0, round(start_res.get(pid, 0) + gathered - spent))
+            stock = max(0, round(start_res.get(pid, 0) + gathered + bonus - spent))
             rows.append([t, vills, round(gathered), stock])
         est[pid] = rows
     return est
@@ -1433,6 +1464,11 @@ details.grp h2 { margin: 18px 0 8px; }
 details.deck { margin: 4px 0; }
 details.deck > summary { cursor: pointer; color: var(--ink-2); padding: 2px 0; }
 details.deck > div { color: var(--muted); font-size: 13px; padding: 4px 0 6px 16px; }
+.maplegend { margin-top: 8px; font-size: 12.5px; color: var(--ink-2); }
+.maplegend label { margin-right: 14px; cursor: pointer; font-variant: small-caps;
+  letter-spacing: 0.04em; white-space: nowrap; }
+.maplegend input { accent-color: var(--accent); vertical-align: -2px;
+  margin-right: 4px; }
 .tip { position: fixed; display: none; background: #fdf6e3; color: var(--ink);
   border: 1px solid var(--border); border-radius: 3px; padding: 4px 9px;
   font-size: 12.5px; pointer-events: none; z-index: 9;
@@ -1700,22 +1736,30 @@ function renderMap(a,b){
   const g=document.getElementById('maplayer');
   if(!g)return;
   const S=D.geom.MS, Y=z=>S-z;
-  let s='';
+  let bld='',atk='',mv='',flr='';
   for(const bd of D.builds) if(inR(bd[0],a,b))
-    s+=`<rect x="${bd[3]-3.5}" y="${Y(bd[4])-3.5}" width="7" height="7" fill="${D.colors[bd[1]]}" stroke="var(--surface)" stroke-width="1" data-tip="${(D.players.find(p=>p[0]===bd[1])||[0,'?'])[1]}: ${D.units[bd[2]]} at ${fmt(bd[0])}"/>`;
+    bld+=`<rect x="${bd[3]-3.5}" y="${Y(bd[4])-3.5}" width="7" height="7" fill="${D.colors[bd[1]]}" stroke="var(--surface)" stroke-width="1" data-tip="${(D.players.find(p=>p[0]===bd[1])||[0,'?'])[1]}: ${D.units[bd[2]]} at ${fmt(bd[0])}"/>`;
   for(const k of [0,3,1]){
     const os=D.orders.filter(e=>e.length>4&&e[2]===k&&inR(e[0],a,b));
     const step=Math.max(1,Math.ceil(os.length/3000));
     for(let i=0;i<os.length;i+=step){
       const e=os[i];
-      if(k===1) s+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="2.6" fill="${D.colors[e[1]]}"/>`;
-      else s+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="1.3" fill="${D.colors[e[1]]}" opacity="${k===0?0.3:0.14}"/>`;
+      if(k===1) atk+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="2.6" fill="${D.colors[e[1]]}"/>`;
+      else mv+=`<circle cx="${e[4]}" cy="${Y(e[5])}" r="1.3" fill="${D.colors[e[1]]}" opacity="${k===0?0.3:0.14}"/>`;
     }
   }
   for(const f of D.flares) if(inR(f[0],a,b))
-    s+=`<g stroke="${D.colors[f[1]]}" stroke-width="2.4"><line x1="${f[2]-6}" y1="${Y(f[3])-6}" x2="${f[2]+6}" y2="${Y(f[3])+6}"/><line x1="${f[2]-6}" y1="${Y(f[3])+6}" x2="${f[2]+6}" y2="${Y(f[3])-6}"/></g>`;
-  g.innerHTML=s;
+    flr+=`<g stroke="${D.colors[f[1]]}" stroke-width="2.4"><line x1="${f[2]-6}" y1="${Y(f[3])-6}" x2="${f[2]+6}" y2="${Y(f[3])+6}"/><line x1="${f[2]-6}" y1="${Y(f[3])+6}" x2="${f[2]+6}" y2="${Y(f[3])-6}"/></g>`;
+  g.innerHTML=`<g id="lay-moves">${mv}</g><g id="lay-builds">${bld}</g><g id="lay-attacks">${atk}</g><g id="lay-flares">${flr}</g>`;
+  applyLays();
 }
+function applyLays(){
+  document.querySelectorAll('#maplegend input').forEach(cb=>{
+    const g=document.getElementById('lay-'+cb.dataset.lay);
+    if(g) g.style.display=cb.checked?'':'none';
+  });
+}
+document.querySelectorAll('#maplegend input').forEach(cb=>cb.addEventListener('change',applyLays));
 const svg=document.getElementById('actsvg');
 if(svg){
   const zone=document.getElementById('brushzone'), rect=document.getElementById('brushrect');
@@ -1804,19 +1848,23 @@ def _map_svg(doc, battles, colors):
     for gline in range(100, mapsz, 100):
         s.append(f'<line x1="{gline}" y1="0" x2="{gline}" y2="{mapsz}" stroke="var(--grid)" stroke-width="0.6"/>')
         s.append(f'<line x1="0" y1="{gline}" x2="{mapsz}" y2="{gline}" stroke="var(--grid)" stroke-width="0.6"/>')
+    s.append('<g id="lay-start">')
     for o in doc["start_objects"]:
         y = mapsz - o["z"]
         s.append(f'<rect x="{o["x"] - 4:.0f}" y="{y - 4:.0f}" width="8" height="8" '
                  f'fill="none" stroke="{colors.get(o["player_id"], "var(--muted)")}" stroke-width="2" '
                  f'data-tip="{pname_map(doc, o["player_id"])}: {o["unit"]} (start)"/>')
+    s.append('</g><g id="maplayer"></g><g id="lay-battles">')
     for i, w in enumerate(battles, 1):
         if not w["loc"]:
             continue
         x, y = w["loc"][0], mapsz - w["loc"][1]
-        s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="11" fill="none" stroke="var(--muted)" '
-                 f'stroke-width="1.5" data-tip="Battle {i}: {fmt_t(w["start"])}–{fmt_t(w["end"])}"/>')
-        s.append(f'<text x="{x:.0f}" y="{y + 4:.0f}" text-anchor="middle" fill="var(--muted)">{i}</text>')
-    s.append('<g id="maplayer"></g></svg>')
+        s.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="13" fill="rgba(246,236,212,0.8)" '
+                 f'stroke="var(--battle)" stroke-width="2.5" '
+                 f'data-tip="Battle {i}: {fmt_t(w["start"])}–{fmt_t(w["end"])}"/>')
+        s.append(f'<text x="{x:.0f}" y="{y + 5:.0f}" text-anchor="middle" '
+                 f'fill="var(--battle)" font-weight="700" font-size="15">{i}</text>')
+    s.append("</g></svg>")
     return "".join(s)
 
 
@@ -2158,7 +2206,7 @@ def build_html(doc):
     out.append("</table></section>")
 
     # activity histogram with brush selection
-    out.append('</details><details class="grp"><summary>✧︎ Battle Analysis</summary>')
+    out.append('</details><details class="grp"><summary>☠︎ Battles</summary>')
     out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
                '<section class="chart">')
     out.append(_activity_chart(players, events, doc["duration_ms"], colors))
@@ -2170,15 +2218,19 @@ def build_html(doc):
     out.append('<h2>Map (selection)</h2>'
                '<section class="chart" style="max-width:780px;margin:0 auto">')
     out.append(_map_svg(doc, battles, colors))
-    out.append('<div class="num" style="font-size:12px;margin-top:6px">'
-               '&#9633; start building &nbsp; &#9632; building placed &nbsp; '
-               '&#9679; attack order &nbsp; &#183; move/gather &nbsp; '
-               '&#10005; flare &nbsp; &#9675; battle</div></section>')
+    out.append('<div class="maplegend" id="maplegend">'
+               '<label><input type="checkbox" checked data-lay="battles">&#9675; battles</label>'
+               '<label><input type="checkbox" checked data-lay="attacks">&#9679; attack orders</label>'
+               '<label><input type="checkbox" checked data-lay="moves">&#183; moves/gather</label>'
+               '<label><input type="checkbox" checked data-lay="builds">&#9632; buildings placed</label>'
+               '<label><input type="checkbox" checked data-lay="flares">&#10005; flares</label>'
+               '<label><input type="checkbox" checked data-lay="start">&#9633; start buildings</label>'
+               '</div></section>')
 
     # battles
     mapsz = _map_size(doc)
     sides = _sides(players)
-    out.append('</details><details class="grp"><summary>☠︎ Battles</summary>')
+    out.append('<h2>Battles</h2>')
     out.append('<div class="bcards">')
     for i, w in enumerate(battles, 1):
         loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
