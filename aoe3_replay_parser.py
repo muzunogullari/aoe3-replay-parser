@@ -968,7 +968,10 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             continue
         kind = ("villager" if (_vill_name(nm) or u in builder_ids
                                or (n and gn / n > 0.5)) else "military")
-        deaths[owner].append((last, kind))
+        # death happened in [last sighting, slot reuse); unconfirmed deaths
+        # get a short grace bracket
+        bracket_end = confirmed[u] if is_conf else last + 120_000
+        deaths[owner].append((last, min(bracket_end, last + 300_000), kind))
         if is_conf:
             death_conf[owner] += 1
     for d in deaths.values():
@@ -1079,7 +1082,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                              "in_battles": 0, "outside_battles": 0}
                    for p in plist}
     for p in plist:
-        for t, kind in deaths[p["id"]]:
+        for t, be, kind in deaths[p["id"]]:
             loss_totals[p["id"]]["military" if kind == "military" else "villagers"] += 1
         loss_totals[p["id"]]["confirmed_by_slot_reuse"] = death_conf.get(p["id"], 0)
     for w in battles:
@@ -1087,10 +1090,11 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         for p in plist:
             pid = p["id"]
             mil_lost = vill_lost = 0
-            for di, (t, kind) in enumerate(deaths[pid]):
+            for di, (t, be, kind) in enumerate(deaths[pid]):
                 if di in used_deaths[pid]:
                     continue
-                if w["start"] - 30_000 <= t < w["end"] + 90_000:
+                # assign if the death bracket [t, be] overlaps the battle
+                if be >= w["start"] - 30_000 and t < w["end"] + 90_000:
                     used_deaths[pid].add(di)
                     if kind == "military":
                         mil_lost += 1
@@ -1103,7 +1107,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                     reinf[e["unit"]] += e.get("count", 1)
             before = mil_types_at(pid, w["start"])
             tt = sum(before.values())
-            mdead = sum(1 for dt, dk in deaths[pid]
+            mdead = sum(1 for dt, dbe, dk in deaths[pid]
                         if dk == "military" and dt < w["start"])
             if tt:
                 ratio = max(0.0, (tt - mdead) / tt)
@@ -1207,7 +1211,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         amt = round(c["amount"] * 0.9)  # tribute fee
         extra_income[c["p"]].append((c["t"], -c["amount"]))
         extra_income[c["to"]].append((c["t"], amt))
-    vill_deaths = {p["id"]: [t for t, k in deaths[p["id"]] if k == "villager"]
+    vill_deaths = {p["id"]: [t for t, be, k in deaths[p["id"]] if k == "villager"]
                    for p in plist}
     estimates = estimate_economy(plist, events, tech_costs, start_res,
                                  start_vills, cmds["duration"],
@@ -2083,7 +2087,7 @@ def build_html(doc):
                for p in players}
 
     def _dead(pid, t, kind):
-        return sum(1 for dt, dk in loss_ev.get(pid, []) if dk == kind and dt <= t)
+        return sum(1 for ev in loss_ev.get(pid, []) if ev[-1] == kind and ev[0] <= t)
 
     def vills_at(pid, t):
         if autovill.get(pid):
@@ -2239,8 +2243,8 @@ def build_html(doc):
     out.append('</details><details class="grp"><summary>⚔︎ Military</summary>')
 
     # alive army size and cumulative losses over time, from the loss model
-    mdeaths = {p["id"]: sorted(t for t, k in loss_ev.get(p["id"], [])
-                               if k == "military") for p in players}
+    mdeaths = {p["id"]: sorted(ev[0] for ev in loss_ev.get(p["id"], [])
+                               if ev[-1] == "military") for p in players}
     alive_series, loss_series = {}, {}
     for p in players:
         pid = p["id"]

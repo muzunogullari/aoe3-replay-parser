@@ -82,13 +82,19 @@ modifiers). On top of the deterministic command stream the parser runs:
   Data.bar. Every shipment send is then named (`card` / `card_name` on
   shipment events; `selected_decks` in the JSON), with the match confidence
   reported.
-- **Battle unit breakdown:** selection ids are stable per unit lifetime, so
-  each battle reports, per player: units committed (distinct ids in attack
-  orders, typed where they existed at game start), how many were never
-  selected again afterward (loss signal) vs seen again, total military
-  trained by then, units trained during the battle, and units queued in the
-  two minutes after it (replacement signal). These are observed facts about
-  selections and training, not simulated kill counts.
+- **Loss detection (mechanical core):** instance ids are
+  `(generation << 16) | slot`, and the engine reuses a slot only after its
+  unit dies — a later id appearing on the same slot proves the earlier unit
+  died between the two sightings (verified on a 50-minute game: 529 reused
+  slots, 1031 consistent orderings, 1 violation, generation strictly
+  monotonic). Confirmed deaths anchor the loss model; ids that stop
+  appearing mid-game are added as unconfirmed losses. Deaths carry a
+  [last-seen, slot-reuse] time bracket and are assigned to battles by
+  bracket overlap, so defenders killed while unselected still land in the
+  right battle. Disappearance clusters around Veteran/Guard researches are
+  recognized as upgrade re-instancing, not deaths. Villager vs military
+  classification uses start-object types, build-command selections (only
+  villagers and wagons construct) and gather-order ratios.
 - **Tributes and market trades:** tribute commands (who sent what resource
   to whom) and market buy/sell commands are decoded as `tribute` and
   `market` events, shown under Economy → Transfers &amp; Market.
