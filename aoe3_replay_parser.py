@@ -513,7 +513,7 @@ def parse_commands(data):
 
     out = {"messages": [], "resigns": [], "trains": [], "builds": [],
            "techs": [], "shipments": [], "orders": [], "tributes": [],
-           "markets": [], "duration": 0}
+           "markets": [], "prod_sels": [], "duration": 0}
     duration = 0
     pos = data.find(DELIM)
     while True:
@@ -558,6 +558,8 @@ def parse_commands(data):
             pos += u2 * 12
             uc = i32(pos); pos += 4
             pos += uc + 1 + 16 + 4
+            if cmd_id in (1, 2) and sel:
+                out["prod_sels"].extend(u for u in sel_ids if u > 100)
             if cmd_id == 0:
                 size = 24 + (8 if data[pos + 24] == 255 else 0)
                 target = i32(pos)
@@ -698,11 +700,15 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     tech_costs = tech_costs or []
     decks = decks or []
 
+    # block-trained units whose batch size is engine-side, not in protoy
+    # (validated against the distinct-unit-id population of the replay)
+    KNOWN_BATCH = {"Strelet": 10, "Cossack": 5}
+
     def unit_cost(proto_id):
         info = unit_info.get(proto_id)
         if not info or not info["cost"]:
             return None, 1
-        batch = info["batch"]
+        batch = max(info["batch"], KNOWN_BATCH.get(protos.get(proto_id, ""), 1))
         return {r: round(v * batch) for r, v in info["cost"].items()}, batch
 
     def player_of(slot):
@@ -811,8 +817,13 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         start_res[pid] += STANDARD_START_RES
 
     resigned = {r["slot"] for r in cmds["resigns"]}
-    plist = [{"id": pid, "name": p.get("name"), "civ": p.get("civname")}
+    plist = [{"id": pid, "name": p.get("name"), "civ": p.get("civname"),
+              "team": p.get("teamid")}
              for pid, p in sorted(players.items())]
+    side_of = {}
+    for si, side in enumerate(_sides(plist)):
+        for p in side:
+            side_of[p["id"]] = si
 
     # deck clusters -> players, by civ-specific card names
     clusters = []
@@ -876,12 +887,52 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                         e["card"] = order[s]
                         e["card_name"] = card_display(order[s])
 
-    # battle unit breakdown from selection ids
-    last_seen = {}
+    # unit lifetime observations from every selection in every order
+    obs = {}  # id -> [owner, first, last, sightings, gather_sightings]
     for o in cmds["orders"]:
+        gather = 1 if (o["kind"] == "target" and o.get("target") in objects
+                       and objects[o["target"]][1] == 0) else 0
         for u in o.get("ids", []):
-            if u > 0:
-                last_seen[u] = max(last_seen.get(u, 0), o["t"])
+            if u <= 0:
+                continue
+            r = obs.get(u)
+            if r is None:
+                obs[u] = [o["p"], o["t"], o["t"], 1, gather]
+            else:
+                r[2] = max(r[2], o["t"])
+                r[3] += 1
+                r[4] += gather
+    prod_ids = set(cmds["prod_sels"])
+
+    def _vill_name(nm):
+        return nm == "Coureur" or nm.startswith("Settler") or "Villager" in nm
+
+    # Veteran/Guard-style upgrades replace every unit of a type with a new
+    # instance id; disappearances clustered around such a research are
+    # re-instancing artifacts, not deaths.
+    upgrade_times = defaultdict(list)
+    for c in cmds["techs"]:
+        if (0 <= c["tech"] < len(tech_costs)
+                and tech_costs[c["tech"]].get("combat")):
+            upgrade_times[c["p"]].append(c["t"])
+
+    # a unit that stops appearing in selections while the game goes on is
+    # treated as lost at its last sighting
+    deaths = defaultdict(list)  # pid -> [(t, "military"|"villager")]
+    for u, (owner, first, last, n, gn) in obs.items():
+        if u in prod_ids or last >= cmds["duration"] - 120_000:
+            continue
+        nm = protos.get(objects[u][0], "") if u in objects else ""
+        if nm and not _vill_name(nm) and ("Explorer" in nm or "TownCenter" in nm
+                                          or "Crate" in nm or "Flag" in nm
+                                          or objects[u][1] == 0):
+            continue
+        if any(t - 90_000 <= last <= t + 5_000 for t in upgrade_times[owner]):
+            continue
+        kind = "villager" if (_vill_name(nm) or (n and gn / n > 0.5)) else "military"
+        deaths[owner].append((last, kind))
+    for d in deaths.values():
+        d.sort()
     mil_by = defaultdict(list)  # pid -> [(t, count)]
     mil_run2 = Counter()
     for e in events:
@@ -916,40 +967,72 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                   if pid in protos}
     battles = find_battles(events, cmds["duration"])
     battle_power(plist, events, battles, name_stats, tech_costs)
+    # building registry for attack-target matching: start buildings + placed
+    bldgs = []
+    for inst, (bpid, owner, x, z) in objects.items():
+        nm = protos.get(bpid, "")
+        if 1 <= owner <= 12 and x is not None and nm == "TownCenter":
+            bldgs.append({"t": 0, "owner": owner, "name": nm, "x": x, "z": z,
+                          "inst": inst,
+                          "hp": unit_info.get(bpid, {}).get("hp", 3000) or 3000})
+    for c in cmds["builds"]:
+        nm = protos.get(c["proto"], "")
+        st = next((info for pid2, info in unit_info.items()
+                   if pid2 == c["proto"]), {})
+        bldgs.append({"t": c["t"], "owner": c["p"], "name": nm,
+                      "x": c["x"], "z": c["z"], "inst": None,
+                      "hp": st.get("hp", 2000) or 2000})
+
+    def avg_dps(pid, t):
+        tot = n = 0.0
+        for u, lst in mil_type_events[pid].items():
+            cnt = sum(k for tt, k in lst if tt <= t)
+            d = name_stats.get(u, {}).get("dps", 0)
+            if cnt and d:
+                tot += cnt * d
+                n += cnt
+        return tot / n if n else 8.0
+
+    used_deaths = defaultdict(set)
+    loss_totals = {p["id"]: {"military": 0, "villagers": 0,
+                             "in_battles": 0, "outside_battles": 0}
+                   for p in plist}
+    for p in plist:
+        for t, kind in deaths[p["id"]]:
+            loss_totals[p["id"]]["military" if kind == "military" else "villagers"] += 1
     for w in battles:
         w["units"] = {}
         for p in plist:
             pid = p["id"]
-            involved = set()
-            for o in cmds["orders"]:
-                if (o["p"] == pid and o["kind"] == "target"
-                        and w["start"] <= o["t"] < w["end"]):
-                    tgt = o.get("target")
-                    if tgt is not None and tgt in objects and objects[tgt][1] == 0:
-                        continue  # gather order on a Gaia object
-                    involved.update(u for u in o.get("ids", []) if u > 0)
-            if not involved:
-                continue
-            typed = Counter()
-            for u in involved:
-                if u in objects:
-                    typed[protos.get(objects[u][0], "?")] += 1
-            grace = w["end"] + 30_000
-            endgame = w["end"] + 120_000 >= cmds["duration"]
-            lost = sum(1 for u in involved if last_seen.get(u, 0) < grace)
-            reinf, repl = Counter(), Counter()
+            mil_lost = vill_lost = 0
+            for di, (t, kind) in enumerate(deaths[pid]):
+                if di in used_deaths[pid]:
+                    continue
+                if w["start"] - 30_000 <= t < w["end"] + 90_000:
+                    used_deaths[pid].add(di)
+                    if kind == "military":
+                        mil_lost += 1
+                    else:
+                        vill_lost += 1
+            reinf = Counter()
             for e in events:
-                if e["type"] == "train" and e["player_id"] == pid:
-                    if w["start"] <= e["t_ms"] < w["end"]:
-                        reinf[e["unit"]] += e.get("count", 1)
-                    elif w["end"] <= e["t_ms"] < w["end"] + 120_000:
-                        repl[e["unit"]] += e.get("count", 1)
-            # Before / made / lost / after per unit type. Lost total is the
-            # not-seen-again id count, allocated across types by army mix.
+                if (e["type"] == "train" and e["player_id"] == pid
+                        and w["start"] <= e["t_ms"] < w["end"] + 90_000):
+                    reinf[e["unit"]] += e.get("count", 1)
             before = mil_types_at(pid, w["start"])
+            tt = sum(before.values())
+            mdead = sum(1 for dt, dk in deaths[pid]
+                        if dk == "military" and dt < w["start"])
+            if tt:
+                ratio = max(0.0, (tt - mdead) / tt)
+                before = {u: round(n * ratio) for u, n in before.items()}
+                before = {u: n for u, n in before.items() if n}
             made = {u: n for u, n in reinf.items()
-                    if u in mil_type_events[pid] or not u.startswith(("Settler", "Coureur", "Fishing"))}
-            lost_total = 0 if endgame else min(lost, sum(before.values()) + sum(made.values()))
+                    if not (u == "Coureur" or u.startswith(("Settler", "Fishing")))}
+            if not before and not made and not mil_lost and not vill_lost:
+                continue
+            loss_totals[pid]["in_battles"] += mil_lost + vill_lost
+            lost_total = min(mil_lost, sum(before.values()) + sum(made.values()))
             pool = {u: before.get(u, 0) + made.get(u, 0)
                     for u in set(before) | set(made)}
             pool_sum = sum(pool.values())
@@ -964,15 +1047,63 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                               "after": before.get(u, 0) + made.get(u, 0) - li})
             table.sort(key=lambda r: -r["after"])
             w["units"][p["name"]] = {
-                "involved": len(involved),
-                "known_types": dict(typed.most_common(4)),
-                "not_seen_after": None if endgame else lost,
-                "seen_after": None if endgame else len(involved) - lost,
+                "military_lost": mil_lost,
+                "villagers_lost": vill_lost,
                 "military_trained_total": mil_total_at(pid, w["start"]),
-                "reinforced_during": dict(reinf.most_common(6)),
-                "queued_after": dict(repl.most_common(6)),
                 "table": table,
             }
+
+        # buildings attacked in this battle, with rough damage-share estimate
+        pname_by_id = {p["id"]: p["name"] for p in plist}
+        hits = {}
+        for o in cmds["orders"]:
+            if o["kind"] != "target" or not (w["start"] <= o["t"] < w["end"] + 30_000):
+                continue
+            tgt = o.get("target")
+            b = None
+            if tgt is not None and tgt in objects:
+                if objects[tgt][1] == 0:
+                    continue
+                b = next((bb for bb in bldgs if bb["inst"] == tgt), None)
+            else:
+                best = None
+                for bb in bldgs:
+                    if bb["owner"] == o["p"] or bb["t"] > o["t"]:
+                        continue
+                    d2 = (bb["x"] - o["x"]) ** 2 + (bb["z"] - o["z"]) ** 2
+                    if d2 <= 64 and (best is None or d2 < best[0]):
+                        best = (d2, bb)
+                b = best[1] if best else None
+            if b is None or side_of.get(b["owner"]) == side_of.get(o["p"]):
+                continue
+            key = (b["owner"], b["name"], round(b["x"]), round(b["z"]))
+            h = hits.setdefault(key, {"hp": b["hp"], "attackers": {}})
+            a = h["attackers"].setdefault(
+                o["p"], {"orders": 0, "t0": o["t"], "t1": o["t"], "sel_sum": 0})
+            a["orders"] += 1
+            a["t0"] = min(a["t0"], o["t"])
+            a["t1"] = max(a["t1"], o["t"])
+            a["sel_sum"] += o["sel"]
+        w["buildings"] = []
+        for (owner, nm, bx, bz), h in hits.items():
+            per = {}
+            total = 0.0
+            for apid, a in h["attackers"].items():
+                span = max(8.0, (a["t1"] - a["t0"]) / 1000)
+                mean_sel = a["sel_sum"] / a["orders"]
+                dmg = mean_sel * avg_dps(apid, w["start"]) * span * 0.5
+                per[pname_by_id.get(apid, apid)] = dmg
+                total += dmg
+            w["buildings"].append({
+                "building": f'{pname_by_id.get(owner, owner)} {nm}',
+                "loc": [bx, bz],
+                "damage_pct_est": min(100, round(100 * total / h["hp"])),
+                "by": {k: min(100, round(100 * v / h["hp"]))
+                       for k, v in per.items()}})
+        w["buildings"].sort(key=lambda b: -b["damage_pct_est"])
+    for p in plist:
+        lt = loss_totals[p["id"]]
+        lt["outside_battles"] = lt["military"] + lt["villagers"] - lt["in_battles"]
     estimates = estimate_economy(plist, events, tech_costs, start_res,
                                  start_vills, cmds["duration"])
     battles_json = [
@@ -980,11 +1111,14 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
          "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
          "attack_orders": w["orders"], "peak_army": w["peak_sel"],
          "loc": w["loc"], "targets_hit": w["targets"],
-         "power_estimate": w["power"], "units": w["units"]}
+         "power_estimate": w["power"], "units": w["units"],
+         "buildings": w["buildings"]}
         for i, w in enumerate(battles)]
     return {
         "start_objects": start_objects,
         "start_resources_estimate": dict(start_res),
+        "loss_estimate": {str(k): v for k, v in loss_totals.items()},
+        "loss_events": {str(k): v for k, v in deaths.items()},
         "selected_decks": {str(k): {"name": v["name"],
                                     "matched_arrivals": v["matched_arrivals"],
                                     "arrivals_total": v["arrivals_total"],
@@ -1728,14 +1862,23 @@ def build_html(doc):
                 hi = mid
         return pairs[lo - 1][1] if lo else 0
 
+    loss_ev = {p["id"]: sorted(doc.get("loss_events", {}).get(str(p["id"]), []))
+               for p in players}
+
+    def _dead(pid, t, kind):
+        return sum(1 for dt, dk in loss_ev.get(pid, []) if dk == kind and dt <= t)
+
     def vills_at(pid, t):
         if autovill.get(pid):
             r = est_row(pid, t)
-            return f"~{r[1]}" if r else "auto"
-        return start_vills[pid] + bisect_right(vill_t[pid], t)
+            base = r[1] if r else 0
+        else:
+            base = start_vills[pid] + bisect_right(vill_t[pid], t)
+        alive = max(0, base - _dead(pid, t, "villager"))
+        return f"~{alive}" if autovill.get(pid) else alive
 
     def mil_at(pid, t):
-        return _cum_at(mil_t[pid], t)
+        return max(0, _cum_at(mil_t[pid], t) - _dead(pid, t, "military"))
 
     def fmt_k(v):
         return f"{v / 1000:.1f}k" if v >= 1000 else str(int(v))
@@ -1891,6 +2034,20 @@ def build_html(doc):
                        f'<td><span class="bar" style="width:{w}px;background:{colors[p["id"]]}"'
                        f' title="{esc(unit)}: {n}"></span><span class="num">{n}</span></td></tr>')
     out.append("</table></section>")
+    losses = doc.get("loss_estimate", {})
+    if losses:
+        out.append("<h2>Estimated Losses (units that stop appearing in selections)</h2>"
+                   "<section><table>")
+        out.append("<tr><th>Player</th><th>Military</th><th>Villagers</th>"
+                   "<th>In battles</th><th>Outside battles</th></tr>")
+        for p in players:
+            lt = losses.get(str(p["id"])) or losses.get(p["id"]) or {}
+            out.append(f'<tr><td>{chip(p["id"])}{esc(p["name"])}</td>'
+                       f'<td class="num">{lt.get("military", 0)}</td>'
+                       f'<td class="num">{lt.get("villagers", 0)}</td>'
+                       f'<td class="num">{lt.get("in_battles", 0)}</td>'
+                       f'<td class="num">{lt.get("outside_battles", 0)}</td></tr>')
+        out.append("</table></section>")
     out.append("<h2>Military Buildings</h2><section><table>")
     for p in players:
         items = ", ".join(f"{b} ×{n}" for b, n in builds.get(p["id"], Counter()).most_common()
@@ -2024,10 +2181,22 @@ def build_html(doc):
                                f'<td class="num">{r["made"] or "—"}</td>'
                                f'<td class="num">{r["lost"] or "—"}</td>'
                                f'<td class="num">{r["after"]}</td></tr>')
-                out.append(f'<tr><td></td><td class="won">Total</td>'
+                out.append(f'<tr><td></td><td class="won">Total military</td>'
                            f'<td class="num won">{tb}</td><td class="num won">{tm or "—"}</td>'
-                           f'<td class="num won">{tl or "—"}</td><td class="num won">{ta}</td></tr>')
-            out.append("</table></details>")
+                           f'<td class="num won">{u["military_lost"] or "—"}</td>'
+                           f'<td class="num won">{ta}</td></tr>')
+                if u["villagers_lost"]:
+                    out.append(f'<tr><td></td><td>Villagers (est)</td><td></td><td></td>'
+                               f'<td class="num">{u["villagers_lost"]}</td><td></td></tr>')
+            out.append("</table>")
+            if w.get("buildings"):
+                out.append('<div class="bside bt" style="margin-top:6px">Buildings attacked '
+                           '(damage est):</div>')
+                for b in w["buildings"][:6]:
+                    by = ", ".join(f"{esc(k)} ~{v}%" for k, v in b["by"].items())
+                    out.append(f'<div class="bside">{esc(b["building"])} '
+                               f'<span class="num">~{b["damage_pct_est"]}% ({by})</span></div>')
+            out.append("</details>")
         out.append("</div></div>")
     out.append("</div></details>")
 
