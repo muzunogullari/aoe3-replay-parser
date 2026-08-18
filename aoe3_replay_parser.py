@@ -1085,10 +1085,18 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                               "made": made.get(u, 0), "lost": li,
                               "after": before.get(u, 0) + made.get(u, 0) - li})
             table.sort(key=lambda r: -r["after"])
+            def _value(key):
+                return round(sum(r[key] * sum(name_stats.get(r["unit"], {})
+                                              .get("cost", {}).values())
+                                 for r in table))
+            vb, va = _value("before"), _value("after")
             w["units"][p["name"]] = {
                 "military_lost": mil_lost,
                 "villagers_lost": vill_lost,
                 "military_trained_total": mil_total_at(pid, w["start"]),
+                "value_before": vb, "value_after": va,
+                "villsec_before": round(vb / BASE_GATHER),
+                "villsec_after": round(va / BASE_GATHER),
                 "table": table,
             }
 
@@ -2054,7 +2062,7 @@ def build_html(doc):
     stock_series = {p["id"]: [(r[0], r[3]) for r in
                               (est.get(str(p["id"])) or est.get(p["id"]) or [])]
                     for p in players}
-    out.append('<h2>Economy (estimated stockpile — modeled income minus exact spend)</h2>'
+    out.append('<h2>Economy (estimated stockpile — rough model, treat as directional)</h2>'
                '<section class="chart">')
     out.append(_step_chart(stock_series, doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -2094,21 +2102,31 @@ def build_html(doc):
                    f"<td>{esc(items) or '—'}</td></tr>")
     out.append("</table></section>")
 
-    # transfers, ransoms and market trades
-    trans = [e for e in events if e["type"] in ("tribute", "market", "explorer_ransom")]
-    if trans:
+    # transfers, ransoms and market activity
+    trans = [e for e in events if e["type"] in ("tribute", "explorer_ransom")]
+    mkt = defaultdict(lambda: [0, 0])
+    for e in events:
+        if e["type"] == "market":
+            mkt[e["player_id"]][0 if abs(e["amount"]) == 100 else 1] += 1
+    if trans or mkt:
         out.append("<h2>Transfers &amp; Market</h2><section><table>")
         out.append("<tr><th>Time</th><th>Player</th><th>Action</th></tr>")
         for e in trans:
             if e["type"] == "tribute":
                 d = f'tribute {e["amount"]} {e["resource"]} → {e["to"]}'
-            elif e["type"] == "market":
-                d = f'market {e["mode"]} {e["amount"]} {e["resource"]}'
             else:
                 d = f'explorer ransom {e["amount"]} coin → {e["paid_to"]}'
             out.append(f'<tr><td>{fmt_t(e["t_ms"])}</td>'
                        f'<td>{chip(e.get("player_id", 0))}{esc(e["player"])}</td>'
                        f"<td>{esc(d)}</td></tr>")
+        for pid, (lots, other) in sorted(mkt.items()):
+            parts = []
+            if lots:
+                parts.append(f"market trades ×{lots}")
+            if other:
+                parts.append(f"livestock/other sales ×{other}")
+            out.append(f'<tr><td>—</td><td>{chip(pid)}{esc(names.get(pid, pid))}</td>'
+                       f"<td>{esc(', '.join(parts))}</td></tr>")
         out.append("</table></section>")
 
     # military
@@ -2241,6 +2259,17 @@ def build_html(doc):
         out.append(f'<div class="bhead">Battle {i}</div>')
         out.append(f'<div class="bmeta">{fmt_t(w["start"])} – {fmt_t(w["end"])}'
                    f'{" · " + loc if loc else ""} · {total} attack orders</div>')
+        if w.get("units"):
+            side_txt = []
+            for side in sides:
+                sb = sa = 0
+                for p in side:
+                    u = w["units"].get(p["name"])
+                    if u and u.get("table"):
+                        sb += sum(r["before"] for r in u["table"])
+                        sa += sum(r["after"] for r in u["table"])
+                side_txt.append(f"{sb}&#8594;{sa}")
+            out.append(f'<div class="bmeta">&#9876; military {" vs ".join(side_txt)}</div>')
         for side in sides:
             parts = []
             for p in side:
@@ -2294,6 +2323,11 @@ def build_html(doc):
                                f'<td></td><td></td>'
                                f'<td class="num">{u["military_lost"] - tl}</td>'
                                f'<td></td></tr>')
+                out.append(f'<tr><td></td><td class="bt">Army value (vill·sec)</td>'
+                           f'<td class="num" colspan="2">{fmt_k(u["value_before"])} res '
+                           f'({fmt_k(u["villsec_before"])} v·s)</td><td></td>'
+                           f'<td class="num">{fmt_k(u["value_after"])} res '
+                           f'({fmt_k(u["villsec_after"])} v·s)</td></tr>')
                 if u["villagers_lost"]:
                     out.append(f'<tr><td></td><td>Villagers (est)</td><td></td><td></td>'
                                f'<td class="num">{u["villagers_lost"]}</td><td></td></tr>')
