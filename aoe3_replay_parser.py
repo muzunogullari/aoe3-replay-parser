@@ -2102,15 +2102,6 @@ def build_html(doc):
     out.append("</table></section>")
 
     # economy
-    def cumulative(pred):
-        series = {p["id"]: [] for p in players}
-        counts = Counter()
-        for e in events:
-            if e["type"] == "train" and pred(e["unit"]):
-                counts[e["player_id"]] += e.get("count", 1)
-                series[e["player_id"]].append((e["t_ms"], counts[e["player_id"]]))
-        return series
-
     MIL_BLD = re.compile(r"Barracks|Stable|ArtilleryDepot|Blockhouse|Outpost|Fort|"
                          r"Wall|Arsenal|Corral|Tower")
     builds = defaultdict(Counter)
@@ -2119,14 +2110,11 @@ def build_html(doc):
             builds[e["player_id"]][e["building"]] += 1
 
     out.append('</details><details class="grp"><summary>⚖︎ Economy</summary>')
-    out.append('<h2>Economy (villager production, cumulative)</h2><section class="chart">')
-    out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
-    out.append("</section>")
     vill_series = {p["id"]: [(r[0], r[1]) for i, r in
                              enumerate(est.get(str(p["id"])) or est.get(p["id"]) or [])
                              if i % 3 == 0]
                    for p in players}
-    out.append('<h2>Villagers Alive (estimated, deaths and caps applied)</h2>'
+    out.append('<h2>Villagers (live count, estimated — deaths and caps applied)</h2>'
                '<section class="chart">')
     out.append(_step_chart(vill_series, doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -2206,9 +2194,6 @@ def build_html(doc):
 
     # military
     out.append('</details><details class="grp"><summary>⚔︎ Military</summary>')
-    out.append('<h2>Military (production, cumulative train commands)</h2><section class="chart">')
-    out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
-    out.append("</section>")
 
     # alive army size and cumulative losses over time, from the loss model
     mdeaths = {p["id"]: sorted(t for t, k in loss_ev.get(p["id"], [])
@@ -2236,7 +2221,7 @@ def build_html(doc):
                 lpts.append((t, lost))
         alive_series[pid] = pts
         loss_series[pid] = lpts
-    out.append('<h2>Army Size Over Time (alive military, estimated)</h2>'
+    out.append('<h2>Army Size (live count, estimated)</h2>'
                '<section class="chart">')
     out.append(_step_chart(alive_series, doc["duration_ms"], colors, tip_label))
     out.append("</section>")
