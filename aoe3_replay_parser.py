@@ -980,6 +980,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     name_initres = {protos[k]: v.get("initres", 0) for k, v in unit_info.items()
                     if k in protos}
     crate_gifts = defaultdict(list)  # pid -> [(t, resources)]
+    vill_gifts = defaultdict(list)   # pid -> [(t, count)]
     for e in events:
         if e["type"] == "shipment" and e.get("card") in tech_ord:
             info = tech_costs[tech_ord[e["card"]]]
@@ -989,7 +990,11 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                     crate_gifts[e["player_id"]].append(
                         (e["t_ms"] + 40_000, round(n * name_initres[ut])))
                     continue
-                if (_vill_name(ut) or n <= 0
+                if _vill_name(ut) and n > 0:
+                    vill_gifts[e["player_id"]].append((e["t_ms"] + 40_000, n))
+                    delivered[ut] = delivered.get(ut, 0) + n
+                    continue
+                if (n <= 0
                         or re.search(r"Crate|Wagon|Flag|Covered|Sheep|Cow|Llama", ut)):
                     continue
                 t_arr = e["t_ms"] + 40_000
@@ -1183,7 +1188,8 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                                  start_vills, cmds["duration"],
                                  vill_deaths=vill_deaths,
                                  extra_income=dict(extra_income),
-                                 vill_stats=name_stats)
+                                 vill_stats=name_stats,
+                                 vill_extra=dict(vill_gifts))
     battles_json = [
         {"n": i + 1, "start_ms": w["start"], "end_ms": w["end"],
          "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
@@ -1267,7 +1273,7 @@ OTTOMAN_SPAWN_FACTOR = 1.6
 
 def estimate_economy(players, events, tech_info, start_res, start_vills,
                      duration_ms, vill_deaths=None, extra_income=None,
-                     vill_stats=None):
+                     vill_stats=None, vill_extra=None):
     """Income model built from the game's own numbers: the civ villager's
     per-task gather rates (protoy), researched gather multipliers applied to
     their matching task, mills/plantations switching food/coin tasks off
@@ -1277,6 +1283,7 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
     vill_deaths = vill_deaths or {}
     extra_income = extra_income or {}
     vill_stats = vill_stats or {}
+    vill_extra = vill_extra or {}
     est = {}
     for p in players:
         pid = p["id"]
@@ -1313,10 +1320,12 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
         spend.sort()
         vdead = sorted(vill_deaths.get(pid, []))
         extra = sorted(extra_income.get(pid, []))
+        vgifts = sorted(vill_extra.get(pid, []))
 
         rows = []
         gathered = 0.0
-        vi = si = ri = di = xi = 0
+        vi = si = ri = di = xi = gi = 0
+        vgift_run = 0
         spent = bonus = 0
         b = {"hunt": 0.0, "mill": 0.0, "tree": 0.0, "mine": 0.0, "plant": 0.0}
         cap = cap_base
@@ -1333,6 +1342,9 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
             while xi < len(extra) and extra[xi][0] <= t:
                 bonus += extra[xi][1]
                 xi += 1
+            while gi < len(vgifts) and vgifts[gi][0] <= t:
+                vgift_run += vgifts[gi][1]
+                gi += 1
             while ri < len(research) and research[ri][0] <= t:
                 tid = research[ri][1]
                 if 0 <= tid < len(tech_info):
@@ -1349,9 +1361,9 @@ def estimate_economy(players, events, tech_info, start_res, start_vills,
             if auto:
                 ntc = 1 + sum(1 for x in tc_times if x <= t)
                 auto_v += ntc * (BUCKET_MS / 1000) / (tp * OTTOMAN_SPAWN_FACTOR)
-                vills = int(min(cap, auto_v))
+                vills = int(min(cap, auto_v + vgift_run))
             else:
-                vills = min(cap, start_vills.get(pid, 0) + vi)
+                vills = min(cap, start_vills.get(pid, 0) + vi + vgift_run)
             vills = max(0, vills - di)
             food_r = (r_mill * (1 + b["mill"])
                       if any(mt <= t - 60_000 for mt in mills)
@@ -2010,6 +2022,10 @@ def build_html(doc):
     mil_run, sp_run = Counter(), Counter()
     for e in events:
         pid = e.get("player_id")
+        if e["type"] == "shipment" and e.get("units_delivered"):
+            for du, dn in e["units_delivered"].items():
+                if is_villager(du):
+                    vill_t[pid].extend([e["t_ms"] + 40_000] * dn)
         if e["type"] == "train":
             if is_villager(e["unit"]):
                 vill_t[pid].append(e["t_ms"])
@@ -2020,6 +2036,8 @@ def build_html(doc):
             sp_res[pid].update(e["cost"])
             sp_run[pid] += sum(e["cost"].values())
             sp_t[pid].append((e["t_ms"], sp_run[pid]))
+    for pid in vill_t:
+        vill_t[pid].sort()
     start_vills = Counter()
     for o in doc["start_objects"]:
         if is_villager(o["unit"]):
