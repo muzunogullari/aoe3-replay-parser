@@ -305,6 +305,40 @@ def build_name_tables(data):
     return protos, techs, unit_info, tech_costs
 
 
+# ---------------------------------------------------------------- decks
+
+def parse_decks(data, techs):
+    """Home-city decks serialized in the replay: '\\x00\\x00\\x00Dk' marker,
+    then id, name, game id, card list (techtree ordinals)."""
+    decks = []
+    pos = 0
+    while True:
+        pos = data.find(b"\x00\x00\x00\x44\x6b", pos)
+        if pos == -1:
+            break
+        p = pos + 9
+        if struct.unpack_from("<i", data, p)[0] != 5:
+            pos += 1
+            continue
+        p += 8
+        nlen = struct.unpack_from("<i", data, p)[0]; p += 4
+        if not (0 < nlen < 60):
+            pos += 1
+            continue
+        name = data[p:p + 2 * nlen].decode("utf-16-le", "replace"); p += 2 * nlen
+        game_id = struct.unpack_from("<i", data, p)[0]; p += 4 + 2
+        cc = struct.unpack_from("<i", data, p)[0]; p += 4
+        if not (0 <= cc <= 40):
+            pos += 1
+            continue
+        cards = struct.unpack_from(f"<{cc}i", data, p)
+        decks.append({"off": pos, "name": name, "game_id": game_id,
+                      "cards": [techs[c] if 0 <= c < len(techs) else f"card#{c}"
+                                for c in cards]})
+        pos += 1
+    return decks
+
+
 # ------------------------------------------------------- start-world objects
 
 def parse_start_objects(data, protos):
@@ -357,7 +391,8 @@ def parse_commands(data):
         return struct.unpack_from("<f", data, p)[0]
 
     out = {"messages": [], "resigns": [], "trains": [], "builds": [],
-           "techs": [], "shipments": [], "orders": [], "duration": 0}
+           "techs": [], "shipments": [], "orders": [], "tributes": [],
+           "markets": [], "duration": 0}
     duration = 0
     pos = data.find(DELIM)
     while True:
@@ -431,9 +466,19 @@ def parse_commands(data):
                 size = 44
             elif cmd_id == 12:
                 size = 36 + (1 if unknown1 == 0 else 0)
+            elif cmd_id == 13:
+                out["markets"].append({"t": duration, "p": player,
+                                       "mode": i32(pos), "res": i32(pos + 4),
+                                       "amount": round(f32(pos + 8))})
+                size = 12
             elif cmd_id == 16:
                 out["resigns"].append({"t": duration, "slot": i32(pos + 4)})
                 size = 13
+            elif cmd_id == 19:
+                out["tributes"].append({"t": duration, "p": player,
+                                        "res": i32(pos), "to": i32(pos + 4),
+                                        "amount": round(f32(pos + 8))})
+                size = 17
             elif cmd_id == 41:
                 c1 = i32(pos)
                 size = 20
@@ -467,12 +512,16 @@ def pname(players, slot):
     return p["name"] if p else f"player{slot}"
 
 
+RES_NAMES = {0: "coin", 1: "wood", 2: "food"}
+
+
 def build_events(path, game, players, cmds, protos, techs, objects=None,
-                 unit_info=None, tech_costs=None):
+                 unit_info=None, tech_costs=None, decks=None):
     """Every action from the replay as one flat timestamped event list (JSON)."""
     objects = objects or {}
     unit_info = unit_info or {}
     tech_costs = tech_costs or []
+    decks = decks or []
 
     def unit_cost(proto_id):
         info = unit_info.get(proto_id)
@@ -549,6 +598,18 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
         events.append({"t_ms": c["t"], "type": "shipment",
                        "player_id": c["p"], "player": player_of(c["p"]),
                        "card_slot": c["card"]})
+    for c in cmds["tributes"]:
+        events.append({"t_ms": c["t"], "type": "tribute",
+                       "player_id": c["p"], "player": player_of(c["p"]),
+                       "to_id": c["to"], "to": player_of(c["to"]),
+                       "resource": RES_NAMES.get(c["res"], f"res{c['res']}"),
+                       "amount": c["amount"]})
+    for c in cmds["markets"]:
+        events.append({"t_ms": c["t"], "type": "market",
+                       "player_id": c["p"], "player": player_of(c["p"]),
+                       "mode": "buy" if c["mode"] == 1 else "sell",
+                       "resource": RES_NAMES.get(c["res"], f"res{c['res']}"),
+                       "amount": c["amount"]})
     for r in cmds["resigns"]:
         events.append({"t_ms": r["t"], "type": "resign",
                        "player_id": r["slot"], "player": player_of(r["slot"])})
@@ -577,6 +638,27 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     resigned = {r["slot"] for r in cmds["resigns"]}
     plist = [{"id": pid, "name": p.get("name"), "civ": p.get("civname")}
              for pid, p in sorted(players.items())]
+
+    # deck clusters -> players, by civ-specific card names
+    clusters = []
+    for d in sorted(decks, key=lambda d: d["off"]):
+        if clusters and d["off"] - clusters[-1][-1]["off"] < 0x40000:
+            clusters[-1].append(d)
+        else:
+            clusters.append([d])
+    player_decks = {}
+    for cl in clusters:
+        text = " ".join(c for d in cl for c in d["cards"])
+        best, best_n = None, 0
+        for p in plist:
+            hint = re.sub(r"s$", "", p["civ"] or "")
+            n = text.count(hint) if hint else 0
+            if n > best_n:
+                best, best_n = p["id"], n
+        if best is not None and best not in player_decks:
+            keep = [d for d in cl if d["game_id"] == 4 and "Revolution" not in d["name"]]
+            player_decks[best] = [{"name": d["name"], "cards": d["cards"]}
+                                  for d in (keep or cl[:6])]
     name_stats = {protos[pid]: info for pid, info in unit_info.items()
                   if pid in protos}
     battles = find_battles(events, cmds["duration"])
@@ -593,6 +675,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     return {
         "start_objects": start_objects,
         "start_resources_estimate": dict(start_res),
+        "decks": {str(k): v for k, v in player_decks.items()},
         "battles": battles_json,
         "economy_estimate_10s": {str(k): v for k, v in estimates.items()},
         "_battles_internal": battles,
@@ -843,6 +926,15 @@ tr:last-child td { border-bottom: none; }
   font-variant-numeric: tabular-nums; }
 .bside { padding: 3px 0; border-top: 1px solid var(--grid); font-size: 13px; }
 .bt { color: var(--ink-2); }
+details.grp { margin-top: 26px; }
+details.grp > summary { cursor: pointer; font-size: 15px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+  padding: 6px 0; user-select: none; }
+details.grp > summary:hover { color: var(--ink-2); }
+details.grp h2 { margin: 18px 0 8px; }
+details.deck { margin: 4px 0; }
+details.deck > summary { cursor: pointer; color: var(--ink-2); padding: 2px 0; }
+details.deck > div { color: var(--muted); font-size: 13px; padding: 4px 0 6px 16px; }
 .tip { position: fixed; display: none; background: var(--surface); color: var(--ink);
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
   font-size: 12px; pointer-events: none; z-index: 9;
@@ -1266,6 +1358,7 @@ def build_html(doc):
         out.append(f'<div class="meta won">Winners: {esc(", ".join(winners))}</div>')
 
     # players
+    out.append('<details class="grp" open><summary>Players &amp; Timeline</summary>')
     out.append("<h2>Players</h2><section><table>")
     out.append("<tr><th>Player</th><th>Civ</th><th>Team</th><th>Home City</th><th>Result</th></tr>")
     resign_t = {e["player_id"]: e["t"] for e in events if e["type"] == "resign"}
@@ -1355,7 +1448,8 @@ def build_html(doc):
     # timeline: age-ups, shipments, battles, resigns on one axis
     out.append('<h2>Timeline</h2><section class="chart">')
     out.append(_timeline_chart(players, events, battles, doc["duration_ms"], colors))
-    out.append("</section>")
+    out.append("</section></details>")
+    out.append('<details class="grp" open><summary>Aging</summary>')
 
     # aging: per age-up event, everyone's villager / military-trained state
     age_events = []
@@ -1393,6 +1487,7 @@ def build_html(doc):
         if e["type"] == "build":
             builds[e["player_id"]][e["building"]] += 1
 
+    out.append('</details><details class="grp"><summary>Economy</summary>')
     out.append('<h2>Economy (villager production, cumulative)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -1443,7 +1538,25 @@ def build_html(doc):
                    f"<td>{esc(items) or '—'}</td></tr>")
     out.append("</table></section>")
 
+    # transfers, ransoms and market trades
+    trans = [e for e in events if e["type"] in ("tribute", "market", "explorer_ransom")]
+    if trans:
+        out.append("<h2>Transfers &amp; Market</h2><section><table>")
+        out.append("<tr><th>Time</th><th>Player</th><th>Action</th></tr>")
+        for e in trans:
+            if e["type"] == "tribute":
+                d = f'tribute {e["amount"]} {e["resource"]} → {e["to"]}'
+            elif e["type"] == "market":
+                d = f'market {e["mode"]} {e["amount"]} {e["resource"]}'
+            else:
+                d = f'explorer ransom {e["amount"]} coin → {e["paid_to"]}'
+            out.append(f'<tr><td>{fmt_t(e["t_ms"])}</td>'
+                       f'<td>{chip(e.get("player_id", 0))}{esc(e["player"])}</td>'
+                       f"<td>{esc(d)}</td></tr>")
+        out.append("</table></section>")
+
     # military
+    out.append('</details><details class="grp"><summary>Military</summary>')
     out.append('<h2>Military (production, cumulative train commands)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -1472,19 +1585,44 @@ def build_html(doc):
                    f"<td>{esc(items) or '—'}</td></tr>")
     out.append("</table></section>")
 
-    # shipments
+    # shipments & decks
+    out.append('</details><details class="grp"><summary>Shipments &amp; Decks</summary>')
     ships = defaultdict(list)
+    arrivals = defaultdict(list)
     for e in events:
         if e["type"] == "shipment":
             ships[e["player_id"]].append(e["t"])
+        elif e["type"] == "system" and "Shipment has arrived" in e["text"]:
+            arrivals[e["to_id"]].append(
+                f'{e["t"]} {e["text"].split(" Shipment has arrived")[0]}')
     out.append("<h2>Shipments</h2><section><table>")
+    out.append("<tr><th>Player</th><th>Sent</th><th>Send times</th>"
+               "<th>Named arrivals (partial, from notifications)</th></tr>")
     for p in players:
         ts = ships.get(p["id"], [])
         out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
-                   f"<td class='num'>{len(ts)}</td><td>{esc(', '.join(ts))}</td></tr>")
+                   f"<td class='num'>{len(ts)}</td><td>{esc(', '.join(ts))}</td>"
+                   f"<td>{esc(', '.join(arrivals.get(p['id'], []))) or '—'}</td></tr>")
     out.append("</table></section>")
 
+    def card_disp(c):
+        c = re.sub(r"^(DE|RG|YP|XP)?HC(REV)?(Ship|XP)?", "", c)
+        return re.sub(r"(?<=[a-z])(?=[A-Z0-9])", " ", c)
+
+    deck_data = doc.get("decks", {})
+    if deck_data:
+        out.append("<h2>Saved Decks</h2><section>")
+        for p in players:
+            for d in deck_data.get(str(p["id"]), deck_data.get(p["id"], [])):
+                cards = ", ".join(card_disp(c) for c in d["cards"])
+                out.append(f'<details class="deck"><summary>{chip(p["id"])}'
+                           f'{esc(p["name"])} — {esc(d["name"])} '
+                           f'<span class="num">({len(d["cards"])} cards)</span></summary>'
+                           f"<div>{esc(cards)}</div></details>")
+        out.append("</section>")
+
     # improvements: every research, chronological
+    out.append('</details><details class="grp"><summary>Improvements</summary>')
     out.append("<h2>Improvements (research queued)</h2><section><table>")
     out.append("<tr><th>Time</th><th>Player</th><th>Improvement</th></tr>")
     for e in events:
@@ -1496,6 +1634,7 @@ def build_html(doc):
     out.append("</table></section>")
 
     # activity histogram with brush selection
+    out.append('</details><details class="grp" open><summary>Battle Analysis</summary>')
     out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
                '<section class="chart">')
     out.append(_activity_chart(players, events, doc["duration_ms"], colors))
@@ -1515,7 +1654,8 @@ def build_html(doc):
     # battles
     mapsz = _map_size(doc)
     sides = _sides(players)
-    out.append('<h2>Battles</h2><div class="bcards">')
+    out.append('</details><details class="grp" open><summary>Battles</summary>')
+    out.append('<div class="bcards">')
     for i, w in enumerate(battles, 1):
         loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
         total = w["count"]
@@ -1549,7 +1689,7 @@ def build_html(doc):
                 out.append(f'<div class="bside bt">Explorer down: {esc(e["player"])} '
                            f'(ransom {e["amount"]} coin → {esc(e["paid_to"])})</div>')
         out.append("</div></div>")
-    out.append("</div>")
+    out.append("</div></details>")
 
     out.append("</main>")
 
@@ -1715,7 +1855,7 @@ def main():
         return f"{stem}.{ext}" if arg == "auto" else arg
 
     doc = build_events(path, game, players, cmds, protos, techs, objects,
-                       unit_info, tech_costs)
+                       unit_info, tech_costs, parse_decks(data, techs))
     wrote_any = False
     if args.json:
         target = resolve(args.json, "json")

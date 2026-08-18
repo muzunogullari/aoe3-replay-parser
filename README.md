@@ -36,7 +36,9 @@ python aoe3_replay_parser.py -j -o --html
 python aoe3_replay_parser.py "path\to\Record Game.age3Yrec" -j out.json --html report.html
 ```
 
-`--html` writes a single-file post-game page, split into: Players · Timeline
+`--html` writes a single-file post-game page organized as collapsible
+sections: Players &amp; Timeline · Aging · Economy · Military · Shipments
+&amp; Decks · Improvements · Battle Analysis · Battles. Content: Players · Timeline
 · Aging (every age-up with all players' villagers, military and resources
 spent at that moment) · Economy (villager production, cumulative resources
 spent, spend totals per resource, economy upgrade timings, economy
@@ -66,6 +68,12 @@ modifiers). On top of the deterministic command stream the parser runs:
   exact spend. Ottoman auto-spawned villagers are modeled from Town Center
   count. Exposed as `economy_estimate_10s` in the JSON and as the estimated
   stockpile chart.
+- **Decks, tributes and market trades:** each player's saved home-city
+  decks (with card lists resolved via the techtree) are parsed from the
+  replay; tribute commands (who sent what resource to whom) and market
+  buy/sell commands are decoded as `tribute` and `market` events and shown
+  under Economy → Transfers &amp; Market. Shipment sends show alongside the
+  named arrivals from the notification feed.
 - **Combat power engine (model estimate):** per battle and player, observed
   peak army size × average unit strength (hp × dps from protoy, with
   researched Veteran/Guard-style Damage/Hitpoints upgrades applied).
