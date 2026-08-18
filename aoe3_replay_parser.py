@@ -529,7 +529,7 @@ def parse_commands(data):
 
     out = {"messages": [], "resigns": [], "trains": [], "builds": [],
            "techs": [], "shipments": [], "orders": [], "tributes": [],
-           "markets": [], "prod_sels": [], "duration": 0}
+           "markets": [], "prod_sels": [], "builder_sels": [], "duration": 0}
     duration = 0
     pos = data.find(DELIM)
     while True:
@@ -576,6 +576,8 @@ def parse_commands(data):
             pos += uc + 1 + 16 + 4
             if cmd_id in (1, 2) and sel:
                 out["prod_sels"].extend(u for u in sel_ids if u > 100)
+            elif cmd_id == 3 and sel:
+                out["builder_sels"].extend(u for u in sel_ids if u > 100)
             if cmd_id == 0:
                 size = 24 + (8 if data[pos + 24] == 255 else 0)
                 target = i32(pos)
@@ -919,6 +921,8 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                 r[3] += 1
                 r[4] += gather
     prod_ids = set(cmds["prod_sels"])
+    # units selected to construct buildings are villagers (or build wagons)
+    builder_ids = set(cmds["builder_sels"])
 
     def _vill_name(nm):
         return nm == "Coureur" or nm.startswith("Settler") or "Villager" in nm
@@ -932,11 +936,28 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                 and tech_costs[c["tech"]].get("combat")):
             upgrade_times[c["p"]].append(c["t"])
 
-    # a unit that stops appearing in selections while the game goes on is
-    # treated as lost at its last sighting
-    deaths = defaultdict(list)  # pid -> [(t, "military"|"villager")]
+    # Instance ids are (generation << 16) | slot, and a slot is only reused
+    # after its unit dies: a later id on the same slot is mechanical proof
+    # the earlier unit died between the two sightings. Ids that simply stop
+    # appearing are counted as unconfirmed losses.
+    slot_seq = defaultdict(list)
     for u, (owner, first, last, n, gn) in obs.items():
-        if u in prod_ids or last >= cmds["duration"] - 120_000:
+        slot_seq[u & 0xFFFF].append((first, u))
+    confirmed = {}
+    for seq in slot_seq.values():
+        if len(seq) < 2:
+            continue
+        seq.sort()
+        for (_, u_old), (fnew, _) in zip(seq, seq[1:]):
+            confirmed[u_old] = fnew  # died before this reuse appeared
+
+    deaths = defaultdict(list)  # pid -> [(t, kind)]
+    death_conf = Counter()
+    for u, (owner, first, last, n, gn) in obs.items():
+        if u in prod_ids:
+            continue
+        is_conf = u in confirmed
+        if not is_conf and last >= cmds["duration"] - 120_000:
             continue
         nm = protos.get(objects[u][0], "") if u in objects else ""
         if nm and not _vill_name(nm) and ("Explorer" in nm or "TownCenter" in nm
@@ -945,8 +966,11 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             continue
         if any(t - 90_000 <= last <= t + 5_000 for t in upgrade_times[owner]):
             continue
-        kind = "villager" if (_vill_name(nm) or (n and gn / n > 0.5)) else "military"
+        kind = ("villager" if (_vill_name(nm) or u in builder_ids
+                               or (n and gn / n > 0.5)) else "military")
         deaths[owner].append((last, kind))
+        if is_conf:
+            death_conf[owner] += 1
     for d in deaths.values():
         d.sort()
     mil_by = defaultdict(list)  # pid -> [(t, count)]
@@ -1057,6 +1081,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
     for p in plist:
         for t, kind in deaths[p["id"]]:
             loss_totals[p["id"]]["military" if kind == "military" else "villagers"] += 1
+        loss_totals[p["id"]]["confirmed_by_slot_reuse"] = death_conf.get(p["id"], 0)
     for w in battles:
         w["units"] = {}
         for p in plist:
@@ -2268,12 +2293,14 @@ def build_html(doc):
         out.append("<h2>Estimated Losses (units that stop appearing in selections)</h2>"
                    "<section><table>")
         out.append("<tr><th>Player</th><th>Military</th><th>Villagers</th>"
+                   "<th>Confirmed (slot reuse)</th>"
                    "<th>In battles</th><th>Outside battles</th></tr>")
         for p in players:
             lt = losses.get(str(p["id"])) or losses.get(p["id"]) or {}
             out.append(f'<tr><td>{chip(p["id"])}{esc(p["name"])}</td>'
                        f'<td class="num">{lt.get("military", 0)}</td>'
                        f'<td class="num">{lt.get("villagers", 0)}</td>'
+                       f'<td class="num">{lt.get("confirmed_by_slot_reuse", 0)}</td>'
                        f'<td class="num">{lt.get("in_battles", 0)}</td>'
                        f'<td class="num">{lt.get("outside_battles", 0)}</td></tr>')
         out.append("</table></section>")
