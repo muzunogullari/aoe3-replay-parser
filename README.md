@@ -68,12 +68,24 @@ modifiers). On top of the deterministic command stream the parser runs:
   exact spend. Ottoman auto-spawned villagers are modeled from Town Center
   count. Exposed as `economy_estimate_10s` in the JSON and as the estimated
   stockpile chart.
-- **Decks, tributes and market trades:** each player's saved home-city
-  decks (with card lists resolved via the techtree) are parsed from the
-  replay; tribute commands (who sent what resource to whom) and market
-  buy/sell commands are decoded as `tribute` and `market` events and shown
-  under Economy → Transfers &amp; Market. Shipment sends show alongside the
-  named arrivals from the notification feed.
+- **Selected deck &amp; named shipments:** each player's deck library is
+  parsed from the replay; the deck actually used is solved by testing every
+  candidate against the game's send/arrival record, using the fact that the
+  in-game shipment panel orders a deck's cards by (card age, home-city list
+  position) — card ages come from the per-civ homecity files in the game's
+  Data.bar. Every shipment send is then named (`card` / `card_name` on
+  shipment events; `selected_decks` in the JSON), with the match confidence
+  reported.
+- **Battle unit breakdown:** selection ids are stable per unit lifetime, so
+  each battle reports, per player: units committed (distinct ids in attack
+  orders, typed where they existed at game start), how many were never
+  selected again afterward (loss signal) vs seen again, total military
+  trained by then, units trained during the battle, and units queued in the
+  two minutes after it (replacement signal). These are observed facts about
+  selections and training, not simulated kill counts.
+- **Tributes and market trades:** tribute commands (who sent what resource
+  to whom) and market buy/sell commands are decoded as `tribute` and
+  `market` events, shown under Economy → Transfers &amp; Market.
 - **Combat power engine (model estimate):** per battle and player, observed
   peak army size × average unit strength (hp × dps from protoy, with
   researched Veteran/Guard-style Damage/Hitpoints upgrades applied).

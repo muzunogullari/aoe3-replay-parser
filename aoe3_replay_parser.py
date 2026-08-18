@@ -305,6 +305,127 @@ def build_name_tables(data):
     return protos, techs, unit_info, tech_costs
 
 
+# --------------------------------------------- game data (Data.bar) support
+
+BAR_CANDIDATES = [
+    r"C:\Program Files (x86)\Steam\steamapps\common\AoE3DE\Game\Data\Data.bar",
+    r"C:\Program Files\Steam\steamapps\common\AoE3DE\Game\Data\Data.bar",
+]
+CIV_HC = {"Russians": "homecityrussians", "British": "homecitybritish",
+          "Ottomans": "homecityottomans", "French": "homecityfrench",
+          "Germans": "homecitygerman", "Dutch": "homecitydutch",
+          "Spanish": "homecityspanish", "Portuguese": "homecityportuguese",
+          "Swedish": "homecityswedish", "Americans": "homecityamericans",
+          "Mexicans": "homecitymexicans", "Italians": "homecityitalians",
+          "Maltese": "homecitymaltese", "Chinese": "homecitychinese",
+          "Japanese": "homecityjapanese", "Indians": "homecityindians",
+          "Inca": "homecitydeinca", "Ethiopians": "homecityethiopians",
+          "Hausa": "homecityhausa", "Haudenosaunee": "homecityxpiroquois",
+          "Lakota": "homecityxpsioux", "Aztecs": "homecityxpaztec"}
+
+
+def _lz4_block(src, usize):
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n and len(dst) < usize:
+        token = src[i]; i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]; i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]; i += lit
+        if i >= n or len(dst) >= usize:
+            break
+        off = src[i] | (src[i + 1] << 8); i += 2
+        ml = (token & 0xF) + 4
+        if (token & 0xF) == 15:
+            while True:
+                b = src[i]; i += 1
+                ml += b
+                if b != 255:
+                    break
+        start = len(dst) - off
+        for k in range(ml):
+            dst.append(dst[start + k])
+    return bytes(dst)
+
+
+def read_bar_file(name_want):
+    """Read one file out of the game's Data.bar (None if game not installed)."""
+    bar = next((b for b in BAR_CANDIDATES if os.path.exists(b)), None)
+    if not bar:
+        return None
+    try:
+        with open(bar, "rb") as f:
+            f.seek(0x120)
+            table_off = struct.unpack("<Q", f.read(8))[0]
+            f.seek(table_off)
+            buf = f.read()
+        p = 0
+        rl = struct.unpack_from("<I", buf, p)[0]; p += 4 + 2 * rl
+        count = struct.unpack_from("<I", buf, p)[0]; p += 4
+        for _ in range(count):
+            off, sz1, sz2, sz3, nl = struct.unpack_from("<QIIII", buf, p); p += 24
+            name = buf[p:p + 2 * nl].decode("utf-16-le"); p += 2 * nl
+            p += 4
+            if name.lower() == name_want.lower():
+                with open(bar, "rb") as f:
+                    f.seek(off)
+                    hdr = f.read(16)
+                    if hdr[:4] == b"alz4":
+                        usize, csize = struct.unpack_from("<II", hdr, 4)
+                        f.seek(off + 16)
+                        return _lz4_block(f.read(csize), usize)
+                    f.seek(off)
+                    return f.read(sz1)
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def hc_card_order(civname):
+    """The civ's home-city card list: name -> (age, position). Slot order in
+    the in-game shipment panel is deck cards sorted by (age, position)."""
+    fname = CIV_HC.get(civname)
+    if not fname:
+        return None
+    xmb = read_bar_file(fname + ".xml.XMB")
+    if not xmb or xmb[:2] != b"X1":
+        return None
+    try:
+        elements, attrs, body = _xmb_tables(xmb, 0)
+    except (struct.error, IndexError):
+        return None
+    cards = {}
+    state = {"cur": None, "pos": 0}
+
+    def visit(elem, a, text, depth):
+        if elem == "card":
+            state["cur"] = {"name": None, "age": 0}
+            return True
+        if state["cur"] is not None:
+            if elem == "name" and state["cur"]["name"] is None:
+                state["cur"]["name"] = text
+            elif elem == "age":
+                try:
+                    state["cur"]["age"] = int(text)
+                except ValueError:
+                    pass
+                if state["cur"]["name"] and state["cur"]["name"] not in cards:
+                    cards[state["cur"]["name"]] = (state["cur"]["age"], state["pos"])
+                    state["pos"] += 1
+        return depth <= 2
+    sys.setrecursionlimit(100000)
+    try:
+        _parse_node(xmb, elements, attrs, body, visit)
+    except (struct.error, IndexError, RecursionError):
+        pass
+    return cards or None
+
+
 # ---------------------------------------------------------------- decks
 
 def parse_decks(data, techs):
@@ -431,6 +552,7 @@ def parse_commands(data):
                 pos += 4
             unknown1 = i32(pos); pos += 4
             sel = i32(pos); pos += 4
+            sel_ids = [i32(pos + 4 * k) for k in range(sel)]
             pos += 4 * sel
             u2 = i32(pos); pos += 4
             pos += u2 * 12
@@ -440,13 +562,14 @@ def parse_commands(data):
                 size = 24 + (8 if data[pos + 24] == 255 else 0)
                 target = i32(pos)
                 out["orders"].append({
-                    "t": duration, "p": player, "sel": sel,
+                    "t": duration, "p": player, "sel": sel, "ids": sel_ids,
                     "kind": "target" if target != -1 else "move",
                     "target": target if target != -1 else None,
                     "x": round(f32(pos + 8), 1), "z": round(f32(pos + 16), 1)})
             elif cmd_id in (4, 12, 13, 23, 24, 25, 34, 37, 46, 53, 57, 61, 63):
                 out["orders"].append({"t": duration, "p": player, "sel": sel,
-                                      "kind": "control", "cmd": cmd_id})
+                                      "ids": sel_ids, "kind": "control",
+                                      "cmd": cmd_id})
             if cmd_id == 0:
                 pass
             elif cmd_id == 1:
@@ -513,6 +636,58 @@ def pname(players, slot):
 
 
 RES_NAMES = {0: "coin", 1: "wood", 2: "food"}
+
+
+def _cardnorm(nm):
+    nm = re.sub(r"^(DE|RG|YP|XP)?HC(REV)?(Ship|XP)?", "", nm)
+    nm = re.sub(r"(Team|Russian|British|Ottoman|French|German)$", "", nm)
+    return re.sub(r"[^a-z]", "", nm.lower())
+
+
+def _cards_match(a, b):
+    from difflib import SequenceMatcher
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a or SequenceMatcher(None, a, b).ratio() >= 0.8
+
+
+def card_display(c):
+    c = re.sub(r"^(DE|RG|YP|XP)?HC(REV)?(Ship|XP)?", "", c)
+    return re.sub(r"(?<=[a-z])(?=[A-Z0-9])", " ", c)
+
+
+def solve_selected_deck(cluster, sends, arrivals, age_at, hc_cards):
+    """Pick the deck + slot ordering that explains the send/arrival record.
+    Slot order = deck cards sorted by (card age, home-city list position)."""
+    if not hc_cards:
+        return None
+    best = None
+    for d in cluster:
+        if len(d["cards"]) < 15:
+            continue
+        order = sorted(d["cards"],
+                       key=lambda c: hc_cards.get(c, (9, 9999)))
+        age_ok = all(s < len(order)
+                     and hc_cards.get(order[s], (0, 0))[0] + 1 <= age_at(t)
+                     for t, s in sends)
+        matched = 0
+        used = set()
+        for at, an in arrivals:
+            for st, s in sends:
+                if (st, s) in used or st >= at or s >= len(order):
+                    continue
+                if _cards_match(_cardnorm(order[s]), re.sub(r"[^a-z]", "", an.lower())):
+                    matched += 1
+                    used.add((st, s))
+                    break
+        score = (age_ok, matched)
+        if best is None or score > best[0]:
+            best = (score, d, order)
+    if best is None or best[0][1] < max(1, len(arrivals) // 3):
+        return None
+    return {"name": best[1]["name"], "slots": best[2],
+            "matched_arrivals": best[0][1], "arrivals_total": len(arrivals),
+            "age_consistent": best[0][0]}
 
 
 def build_events(path, game, players, cmds, protos, techs, objects=None,
@@ -646,7 +821,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             clusters[-1].append(d)
         else:
             clusters.append([d])
-    player_decks = {}
+    player_clusters = {}
     for cl in clusters:
         text = " ".join(c for d in cl for c in d["cards"])
         best, best_n = None, 0
@@ -655,14 +830,116 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             n = text.count(hint) if hint else 0
             if n > best_n:
                 best, best_n = p["id"], n
-        if best is not None and best not in player_decks:
-            keep = [d for d in cl if d["game_id"] == 4 and "Revolution" not in d["name"]]
-            player_decks[best] = [{"name": d["name"], "cards": d["cards"]}
-                                  for d in (keep or cl[:6])]
+        if best is not None and best not in player_clusters:
+            player_clusters[best] = cl
+
+    # selected deck per player + shipment card naming
+    age_msgs = defaultdict(list)
+    for e in events:
+        if e["type"] == "system":
+            m = re.search(r"(.+) has reached the (\w+) AGE", e["text"])
+            if m:
+                age_msgs[m.group(1)].append(
+                    (e["t_ms"], {"COMMERCE": 2, "FORTRESS": 3,
+                                 "INDUSTRIAL": 4, "IMPERIAL": 5}.get(m.group(2), 2)))
+    hc_cache = {}
+    selected_decks = {}
+    for p in plist:
+        pid = p["id"]
+        sends = [(e["t_ms"], e["card_slot"]) for e in events
+                 if e["type"] == "shipment" and e["player_id"] == pid]
+        if not sends or pid not in player_clusters:
+            continue
+        arrivals = [(e["t_ms"], e["text"].split(" Shipment has arrived")[0])
+                    for e in events if e["type"] == "system"
+                    and "Shipment has arrived" in e["text"] and e["to_id"] == pid]
+        my_ages = sorted(age_msgs.get(p["name"], []))
+
+        def age_at(t, ages=my_ages):
+            a = 1
+            for at, av in ages:
+                if at <= t:
+                    a = av
+            return a
+        civ = p["civ"]
+        if civ not in hc_cache:
+            hc_cache[civ] = hc_card_order(civ)
+        solved = solve_selected_deck(player_clusters[pid], sends, arrivals,
+                                     age_at, hc_cache[civ])
+        if solved:
+            selected_decks[pid] = solved
+            order = solved["slots"]
+            for e in events:
+                if e["type"] == "shipment" and e["player_id"] == pid:
+                    s = e["card_slot"]
+                    if s < len(order):
+                        e["card"] = order[s]
+                        e["card_name"] = card_display(order[s])
+
+    # battle unit breakdown from selection ids
+    last_seen = {}
+    for o in cmds["orders"]:
+        for u in o.get("ids", []):
+            if u > 0:
+                last_seen[u] = max(last_seen.get(u, 0), o["t"])
+    mil_by = defaultdict(list)  # pid -> [(t, count)]
+    mil_run2 = Counter()
+    for e in events:
+        if e["type"] == "train" and not (e["unit"] == "Coureur"
+                                         or e["unit"].startswith("Settler")
+                                         or e["unit"].startswith("Fishing")):
+            mil_run2[e["player_id"]] += e.get("count", 1)
+            mil_by[e["player_id"]].append((e["t_ms"], mil_run2[e["player_id"]]))
+
+    def mil_total_at(pid, t):
+        n = 0
+        for tt, v in mil_by[pid]:
+            if tt <= t:
+                n = v
+            else:
+                break
+        return n
     name_stats = {protos[pid]: info for pid, info in unit_info.items()
                   if pid in protos}
     battles = find_battles(events, cmds["duration"])
     battle_power(plist, events, battles, name_stats, tech_costs)
+    for w in battles:
+        w["units"] = {}
+        for p in plist:
+            pid = p["id"]
+            involved = set()
+            for o in cmds["orders"]:
+                if (o["p"] == pid and o["kind"] == "target"
+                        and w["start"] <= o["t"] < w["end"]):
+                    tgt = o.get("target")
+                    if tgt is not None and tgt in objects and objects[tgt][1] == 0:
+                        continue  # gather order on a Gaia object
+                    involved.update(u for u in o.get("ids", []) if u > 0)
+            if not involved:
+                continue
+            typed = Counter()
+            for u in involved:
+                if u in objects:
+                    typed[protos.get(objects[u][0], "?")] += 1
+            grace = w["end"] + 30_000
+            endgame = w["end"] + 120_000 >= cmds["duration"]
+            lost = sum(1 for u in involved if last_seen.get(u, 0) < grace)
+            reinf, repl = Counter(), Counter()
+            for e in events:
+                if e["type"] == "train" and e["player_id"] == pid:
+                    if w["start"] <= e["t_ms"] < w["end"]:
+                        reinf[e["unit"]] += e.get("count", 1)
+                    elif w["end"] <= e["t_ms"] < w["end"] + 120_000:
+                        repl[e["unit"]] += e.get("count", 1)
+            w["units"][p["name"]] = {
+                "involved": len(involved),
+                "known_types": dict(typed.most_common(4)),
+                "not_seen_after": None if endgame else lost,
+                "seen_after": None if endgame else len(involved) - lost,
+                "military_trained_total": mil_total_at(pid, w["start"]),
+                "reinforced_during": dict(reinf.most_common(6)),
+                "queued_after": dict(repl.most_common(6)),
+            }
     estimates = estimate_economy(plist, events, tech_costs, start_res,
                                  start_vills, cmds["duration"])
     battles_json = [
@@ -670,12 +947,16 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
          "start": fmt_t(w["start"]), "end": fmt_t(w["end"]),
          "attack_orders": w["orders"], "peak_army": w["peak_sel"],
          "loc": w["loc"], "targets_hit": w["targets"],
-         "power_estimate": w["power"]}
+         "power_estimate": w["power"], "units": w["units"]}
         for i, w in enumerate(battles)]
     return {
         "start_objects": start_objects,
         "start_resources_estimate": dict(start_res),
-        "decks": {str(k): v for k, v in player_decks.items()},
+        "selected_decks": {str(k): {"name": v["name"],
+                                    "matched_arrivals": v["matched_arrivals"],
+                                    "arrivals_total": v["arrivals_total"],
+                                    "slots": v["slots"]}
+                           for k, v in selected_decks.items()},
         "battles": battles_json,
         "economy_estimate_10s": {str(k): v for k, v in estimates.items()},
         "_battles_internal": battles,
@@ -1588,37 +1869,39 @@ def build_html(doc):
     # shipments & decks
     out.append('</details><details class="grp"><summary>Shipments &amp; Decks</summary>')
     ships = defaultdict(list)
-    arrivals = defaultdict(list)
     for e in events:
         if e["type"] == "shipment":
-            ships[e["player_id"]].append(e["t"])
-        elif e["type"] == "system" and "Shipment has arrived" in e["text"]:
-            arrivals[e["to_id"]].append(
-                f'{e["t"]} {e["text"].split(" Shipment has arrived")[0]}')
-    out.append("<h2>Shipments</h2><section><table>")
-    out.append("<tr><th>Player</th><th>Sent</th><th>Send times</th>"
-               "<th>Named arrivals (partial, from notifications)</th></tr>")
+            label = e.get("card_name") or f'slot {e["card_slot"]}'
+            ships[e["player_id"]].append(f'{e["t"]} {label}')
+    out.append("<h2>Shipments Sent (card resolved from the selected deck)</h2>"
+               "<section><table>")
+    out.append("<tr><th>Player</th><th>Sent</th><th>Shipments</th></tr>")
     for p in players:
         ts = ships.get(p["id"], [])
         out.append(f"<tr><td style='white-space:nowrap'>{chip(p['id'])}{esc(p['name'])}</td>"
-                   f"<td class='num'>{len(ts)}</td><td>{esc(', '.join(ts))}</td>"
-                   f"<td>{esc(', '.join(arrivals.get(p['id'], []))) or '—'}</td></tr>")
+                   f"<td class='num'>{len(ts)}</td><td>{esc(' · '.join(ts)) or '—'}</td></tr>")
     out.append("</table></section>")
 
-    def card_disp(c):
-        c = re.sub(r"^(DE|RG|YP|XP)?HC(REV)?(Ship|XP)?", "", c)
-        return re.sub(r"(?<=[a-z])(?=[A-Z0-9])", " ", c)
-
-    deck_data = doc.get("decks", {})
-    if deck_data:
-        out.append("<h2>Saved Decks</h2><section>")
+    sel_decks = doc.get("selected_decks", {})
+    if sel_decks:
+        out.append("<h2>Selected Decks (validated against arrival notifications)</h2>"
+                   "<section>")
         for p in players:
-            for d in deck_data.get(str(p["id"]), deck_data.get(p["id"], [])):
-                cards = ", ".join(card_disp(c) for c in d["cards"])
-                out.append(f'<details class="deck"><summary>{chip(p["id"])}'
-                           f'{esc(p["name"])} — {esc(d["name"])} '
-                           f'<span class="num">({len(d["cards"])} cards)</span></summary>'
-                           f"<div>{esc(cards)}</div></details>")
+            d = sel_decks.get(str(p["id"])) or sel_decks.get(p["id"])
+            if not d:
+                continue
+            sent_slots = Counter(e["card_slot"] for e in events
+                                 if e["type"] == "shipment" and e["player_id"] == p["id"])
+            items = []
+            for i, c in enumerate(d["slots"]):
+                nm = esc(card_display(c))
+                n = sent_slots.get(i, 0)
+                items.append(f"<b>{nm} ×{n}</b>" if n else nm)
+            out.append(f'<details class="deck" open><summary>{chip(p["id"])}'
+                       f'{esc(p["name"])} — {esc(d["name"])} '
+                       f'<span class="num">(matched {d["matched_arrivals"]}/'
+                       f'{d["arrivals_total"]} arrivals; sent cards in bold)</span></summary>'
+                       f'<div>{", ".join(items)}</div></details>')
         out.append("</section>")
 
     # improvements: every research, chronological
@@ -1688,6 +1971,28 @@ def build_html(doc):
             if e["type"] == "explorer_ransom" and w["start"] <= e["t_ms"] < w["end"]:
                 out.append(f'<div class="bside bt">Explorer down: {esc(e["player"])} '
                            f'(ransom {e["amount"]} coin → {esc(e["paid_to"])})</div>')
+        if w.get("units"):
+            out.append('<details class="deck"><summary class="bt">Unit breakdown</summary>')
+            out.append('<table style="font-size:12.5px"><tr><th>Player</th>'
+                       '<th>Committed</th><th>Of military</th><th>Not seen after</th>'
+                       '<th>Seen after</th><th>Reinforced during</th>'
+                       '<th>Queued after (loss signal)</th></tr>')
+            for p in players:
+                u = w["units"].get(p["name"])
+                if not u:
+                    continue
+                types = ", ".join(f"{t} ×{n}" for t, n in u["known_types"].items())
+                inv = f'{u["involved"]}' + (f' ({types})' if types else "")
+                nsa = "n/a" if u["not_seen_after"] is None else u["not_seen_after"]
+                sa = "n/a" if u["seen_after"] is None else u["seen_after"]
+                ri = ", ".join(f"{t} ×{n}" for t, n in u["reinforced_during"].items()) or "—"
+                qa = ", ".join(f"{t} ×{n}" for t, n in u["queued_after"].items()) or "—"
+                out.append(f'<tr><td>{chip(p["id"])}{esc(p["name"])}</td>'
+                           f'<td class="num">{inv}</td>'
+                           f'<td class="num">{u["military_trained_total"]}</td>'
+                           f'<td class="num">{nsa}</td><td class="num">{sa}</td>'
+                           f'<td>{esc(ri)}</td><td>{esc(qa)}</td></tr>')
+            out.append("</table></details>")
         out.append("</div></div>")
     out.append("</div></details>")
 
