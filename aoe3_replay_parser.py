@@ -1366,64 +1366,77 @@ def find_battles(events, duration_ms):
 
 HTML_STYLE = """
 :root {
-  color-scheme: light dark;
-  --surface: #fcfcfb; --page: #f9f9f7; --ink: #0b0b0b; --ink-2: #52514e;
-  --muted: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
-  --p1: #2a78d6; --p2: #eb6834; --p3: #1baf7a; --p4: #eda100;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --surface: #1a1a19; --page: #0d0d0d; --ink: #ffffff; --ink-2: #c3c2b7;
-    --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
-    --p1: #3987e5; --p2: #d95926; --p3: #199e70; --p4: #c98500;
-  }
+  color-scheme: light;
+  --surface: #f6ecd4; --page: #e7d8b5; --ink: #2b1f10; --ink-2: #55432a;
+  --muted: #8a7350; --grid: #d9c8a2; --border: #b49a68; --accent: #6b4a1f;
+  --battle: #7a2317;
+  --p1: #1f5fa8; --p2: #c05517; --p3: #14707a; --p4: #8a6d1c;
 }
 * { box-sizing: border-box; margin: 0; }
-body { background: var(--page); color: var(--ink);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 32px 16px; }
-main { max-width: 920px; margin: 0 auto; }
-h1 { font-size: 26px; }
-.meta { color: var(--ink-2); margin: 4px 0 8px; }
-h2 { font-size: 15px; letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--muted); margin: 36px 0 10px; }
+body { color: var(--ink);
+  background: radial-gradient(1100px 700px at 30% -5%, #f2e6c8, #e7d8b5 55%, #dbc9a0);
+  background-attachment: fixed;
+  font: 15px/1.55 "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  padding: 36px 16px 60px; }
+main { max-width: 940px; margin: 0 auto; }
+h1 { font-family: Georgia, "Times New Roman", serif; font-size: 38px;
+  font-variant: small-caps; letter-spacing: 0.05em; color: var(--accent);
+  text-shadow: 0 1px 0 #fff3d6; }
+.meta { color: var(--ink-2); margin: 4px 0 8px; font-style: italic; }
+.orn { text-align: center; color: var(--border); font-size: 20px;
+  margin: 10px 0 2px; letter-spacing: 0.6em; }
+h2 { font-family: Georgia, serif; font-size: 15px; font-variant: small-caps;
+  letter-spacing: 0.1em; color: var(--accent); margin: 20px 0 8px; }
 section { background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; padding: 14px 16px; }
+  border-radius: 3px; padding: 15px 18px;
+  box-shadow: inset 0 0 0 3px rgba(255,246,222,0.55), 0 2px 6px rgba(60,40,10,0.18); }
 table { border-collapse: collapse; width: 100%; }
-th { text-align: left; color: var(--muted); font-weight: 500; font-size: 13px;
-  padding: 4px 10px 4px 0; border-bottom: 1px solid var(--grid); }
+th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12.5px;
+  font-variant: small-caps; letter-spacing: 0.06em;
+  padding: 4px 10px 4px 0; border-bottom: 2px solid var(--border); }
 td { padding: 5px 10px 5px 0; border-bottom: 1px solid var(--grid);
   vertical-align: top; font-variant-numeric: tabular-nums; }
 tr:last-child td { border-bottom: none; }
-.chip { display: inline-block; width: 10px; height: 10px; border-radius: 3px;
-  margin-right: 7px; vertical-align: baseline; }
+.chip { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+  border: 1px solid rgba(43,31,16,0.45); margin-right: 7px;
+  vertical-align: baseline; box-shadow: inset 0 1px 0 rgba(255,255,255,0.4); }
 .bar { display: inline-block; height: 12px; border-radius: 0 4px 4px 0;
+  border: 1px solid rgba(43,31,16,0.3); border-left: none;
   vertical-align: middle; margin-right: 7px; }
 .num { color: var(--ink-2); }
-.won { font-weight: 600; }
+.won { font-weight: 700; color: #3d5c1f; }
 .chart svg { display: block; width: 100%; height: auto; }
-.bcards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.bcards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 720px) { .bcards { grid-template-columns: 1fr; } }
 .bcard { background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; padding: 14px 16px; }
-.bcard > svg { width: 100%; height: auto; margin-bottom: 10px; }
-.bhead { font-weight: 600; }
+  border-radius: 3px; padding: 15px 18px;
+  box-shadow: inset 0 0 0 3px rgba(255,246,222,0.55), 0 2px 6px rgba(60,40,10,0.18); }
+.bcard > svg { width: 100%; height: auto; margin-bottom: 10px;
+  border: 1px solid var(--grid); }
+.bhead { font-family: Georgia, serif; font-variant: small-caps; font-weight: 700;
+  font-size: 18px; color: var(--battle); letter-spacing: 0.04em; }
 .bmeta { color: var(--muted); font-size: 13px; margin-bottom: 6px;
   font-variant-numeric: tabular-nums; }
 .bside { padding: 3px 0; border-top: 1px solid var(--grid); font-size: 13px; }
 .bt { color: var(--ink-2); }
-details.grp { margin-top: 26px; }
-details.grp > summary { cursor: pointer; font-size: 15px; font-weight: 600;
-  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
-  padding: 6px 0; user-select: none; }
-details.grp > summary:hover { color: var(--ink-2); }
+details.grp { margin-top: 22px; }
+details.grp > summary { cursor: pointer; font-family: Georgia, serif;
+  font-size: 18px; font-weight: 700; font-variant: small-caps;
+  letter-spacing: 0.08em; color: var(--accent); padding: 8px 12px;
+  user-select: none; background: linear-gradient(#f0e3c2, #e2d0a6);
+  border: 1px solid var(--border); border-radius: 3px;
+  box-shadow: 0 1px 3px rgba(60,40,10,0.25), inset 0 1px 0 rgba(255,248,228,0.8); }
+details.grp > summary:hover { color: var(--battle); background:
+  linear-gradient(#f4e8ca, #e7d6ae); }
+details.grp[open] > summary { border-radius: 3px 3px 0 0; margin-bottom: 10px; }
 details.grp h2 { margin: 18px 0 8px; }
 details.deck { margin: 4px 0; }
 details.deck > summary { cursor: pointer; color: var(--ink-2); padding: 2px 0; }
 details.deck > div { color: var(--muted); font-size: 13px; padding: 4px 0 6px 16px; }
-.tip { position: fixed; display: none; background: var(--surface); color: var(--ink);
-  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
-  font-size: 12px; pointer-events: none; z-index: 9;
-  font-variant-numeric: tabular-nums; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+.tip { position: fixed; display: none; background: #fdf6e3; color: var(--ink);
+  border: 1px solid var(--border); border-radius: 3px; padding: 4px 9px;
+  font-size: 12.5px; pointer-events: none; z-index: 9;
+  font-variant-numeric: tabular-nums; box-shadow: 0 2px 8px rgba(60,40,10,0.3); }
 """
 
 TOOLTIP_JS = """
@@ -1841,9 +1854,10 @@ def build_html(doc):
                f'{doc["recorded"][:16].replace("T", " ")}</div>')
     if winners and len(winners) < len(players):
         out.append(f'<div class="meta won">Winners: {esc(", ".join(winners))}</div>')
+    out.append('<div class="orn">❦</div>')
 
     # players
-    out.append('<details class="grp"><summary>Players &amp; Timeline</summary>')
+    out.append('<details class="grp"><summary>⚑︎ Players &amp; Timeline</summary>')
     out.append("<h2>Players</h2><section><table>")
     out.append("<tr><th>Player</th><th>Civ</th><th>Team</th><th>Home City</th><th>Result</th></tr>")
     resign_t = {e["player_id"]: e["t"] for e in events if e["type"] == "resign"}
@@ -1943,7 +1957,7 @@ def build_html(doc):
     out.append('<h2>Timeline</h2><section class="chart">')
     out.append(_timeline_chart(players, events, battles, doc["duration_ms"], colors))
     out.append("</section></details>")
-    out.append('<details class="grp"><summary>Aging</summary>')
+    out.append('<details class="grp"><summary>⌛︎ Aging</summary>')
 
     # aging: per age-up event, everyone's villager / military-trained state
     age_events = []
@@ -1981,7 +1995,7 @@ def build_html(doc):
         if e["type"] == "build":
             builds[e["player_id"]][e["building"]] += 1
 
-    out.append('</details><details class="grp"><summary>Economy</summary>')
+    out.append('</details><details class="grp"><summary>⚖︎ Economy</summary>')
     out.append('<h2>Economy (villager production, cumulative)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_villager), doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -2050,7 +2064,7 @@ def build_html(doc):
         out.append("</table></section>")
 
     # military
-    out.append('</details><details class="grp"><summary>Military</summary>')
+    out.append('</details><details class="grp"><summary>⚔︎ Military</summary>')
     out.append('<h2>Military (production, cumulative train commands)</h2><section class="chart">')
     out.append(_step_chart(cumulative(is_military), doc["duration_ms"], colors, tip_label))
     out.append("</section>")
@@ -2094,7 +2108,7 @@ def build_html(doc):
     out.append("</table></section>")
 
     # shipments & decks
-    out.append('</details><details class="grp"><summary>Shipments &amp; Decks</summary>')
+    out.append('</details><details class="grp"><summary>⚓︎ Shipments &amp; Decks</summary>')
     ships = defaultdict(list)
     for e in events:
         if e["type"] == "shipment":
@@ -2132,7 +2146,7 @@ def build_html(doc):
         out.append("</section>")
 
     # improvements: every research, chronological
-    out.append('</details><details class="grp"><summary>Improvements</summary>')
+    out.append('</details><details class="grp"><summary>⚙︎ Improvements</summary>')
     out.append("<h2>Improvements (research queued)</h2><section><table>")
     out.append("<tr><th>Time</th><th>Player</th><th>Improvement</th></tr>")
     for e in events:
@@ -2144,7 +2158,7 @@ def build_html(doc):
     out.append("</table></section>")
 
     # activity histogram with brush selection
-    out.append('</details><details class="grp"><summary>Battle Analysis</summary>')
+    out.append('</details><details class="grp"><summary>✧︎ Battle Analysis</summary>')
     out.append('<h2>Activity (orders per 10s — drag to select a range)</h2>'
                '<section class="chart">')
     out.append(_activity_chart(players, events, doc["duration_ms"], colors))
@@ -2164,7 +2178,7 @@ def build_html(doc):
     # battles
     mapsz = _map_size(doc)
     sides = _sides(players)
-    out.append('</details><details class="grp"><summary>Battles</summary>')
+    out.append('</details><details class="grp"><summary>☠︎ Battles</summary>')
     out.append('<div class="bcards">')
     for i, w in enumerate(battles, 1):
         loc = f"({w['loc'][0]:.0f}, {w['loc'][1]:.0f})" if w["loc"] else ""
