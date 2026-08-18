@@ -256,7 +256,8 @@ def build_name_tables(data):
             def visit(elem, a, text, depth):
                 if elem == "tech" and depth == 1:
                     techs.append(a.get("name") or "?")
-                    tstate["cur"] = {"cost": {}, "gather": [], "combat": []}
+                    tstate["cur"] = {"cost": {}, "gather": [], "combat": [],
+                                     "units": []}
                     tech_costs.append(tstate["cur"])
                     return True
                 cu = tstate["cur"]
@@ -281,6 +282,8 @@ def build_name_tables(data):
                         cu["gather"].append((a.get("unittype", ""), amt))
                     elif sub in ("Damage", "Hitpoints"):
                         cu["combat"].append((sub, a.get("unittype", ""), amt))
+                    elif sub == "FreeHomeCityUnit":
+                        cu["units"].append((a.get("unittype", ""), int(amt)))
                 return depth == 0
         else:
             continue
@@ -958,6 +961,34 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                                          or e["unit"].startswith("Fishing")):
             mil_type_events[e["player_id"]][e["unit"]].append(
                 (e["t_ms"], e.get("count", 1)))
+    # shipment cards that deliver units count toward the army too
+    tech_ord = {name: i for i, name in enumerate(techs)}
+    for e in events:
+        if e["type"] == "shipment" and e.get("card") in tech_ord:
+            info = tech_costs[tech_ord[e["card"]]]
+            delivered = {}
+            for ut, n in info.get("units", []):
+                if (_vill_name(ut) or n <= 0
+                        or re.search(r"Crate|Wagon|Flag|Covered|Sheep|Cow|Llama", ut)):
+                    continue
+                t_arr = e["t_ms"] + 40_000
+                mil_type_events[e["player_id"]][ut].append((t_arr, n))
+                mil_run2[e["player_id"]] += n
+                mil_by[e["player_id"]].append((t_arr, mil_run2[e["player_id"]]))
+                delivered[ut] = delivered.get(ut, 0) + n
+            if delivered:
+                e["units_delivered"] = delivered
+    # rebuild cumulative military totals from the merged train+shipment pools
+    mil_by = defaultdict(list)
+    for pid in mil_type_events:
+        entries = sorted((t, n) for lst in mil_type_events[pid].values()
+                         for t, n in lst)
+        run = 0
+        for t, n in entries:
+            run += n
+            mil_by[pid].append((t, run))
+        for u in mil_type_events[pid]:
+            mil_type_events[pid][u].sort()
 
     def mil_types_at(pid, t):
         return {u: sum(n for tt, n in lst if tt <= t)
@@ -1084,7 +1115,7 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             a["t0"] = min(a["t0"], o["t"])
             a["t1"] = max(a["t1"], o["t"])
             a["sel_sum"] += o["sel"]
-        w["buildings"] = []
+        agg = {}
         for (owner, nm, bx, bz), h in hits.items():
             per = {}
             total = 0.0
@@ -1094,13 +1125,19 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
                 dmg = mean_sel * avg_dps(apid, w["start"]) * span * 0.5
                 per[pname_by_id.get(apid, apid)] = dmg
                 total += dmg
-            w["buildings"].append({
-                "building": f'{pname_by_id.get(owner, owner)} {nm}',
-                "loc": [bx, bz],
-                "damage_pct_est": min(100, round(100 * total / h["hp"])),
-                "by": {k: min(100, round(100 * v / h["hp"]))
-                       for k, v in per.items()}})
-        w["buildings"].sort(key=lambda b: -b["damage_pct_est"])
+            g = agg.setdefault((owner, nm),
+                               {"n": 0, "pct": 0, "by": {}, "loc": [bx, bz]})
+            g["n"] += 1
+            g["pct"] = max(g["pct"], min(100, round(100 * total / h["hp"])))
+            for k, v in per.items():
+                g["by"][k] = max(g["by"].get(k, 0),
+                                 min(100, round(100 * v / h["hp"])))
+        w["buildings"] = [
+            {"building": f'{pname_by_id.get(owner, owner)} {nm}',
+             "segments": g["n"], "loc": g["loc"],
+             "damage_pct_est": g["pct"], "by": g["by"]}
+            for (owner, nm), g in agg.items()]
+        w["buildings"].sort(key=lambda b: (-b["damage_pct_est"], -b["segments"]))
     for p in plist:
         lt = loss_totals[p["id"]]
         lt["outside_battles"] = lt["military"] + lt["villagers"] - lt["in_battles"]
@@ -2148,7 +2185,8 @@ def build_html(doc):
                     parts.append(f'{chip(p["id"])}{esc(p["name"])} '
                                  f'<span class="num">{n} orders, army {army}'
                                  f'{", power ~" + fmt_k(pw_) if pw_ else ""}</span>')
-            out.append(f'<div class="bside">{" &nbsp; ".join(parts) if parts else "—"}</div>')
+            if parts:
+                out.append(f'<div class="bside">{" &nbsp; ".join(parts)}</div>')
         state = " &nbsp; ".join(f'{chip(p["id"])}<span class="num">'
                                 f'{vills_at(p["id"], w["start"])} v · '
                                 f'{mil_at(p["id"], w["start"])} m · '
@@ -2183,8 +2221,13 @@ def build_html(doc):
                                f'<td class="num">{r["after"]}</td></tr>')
                 out.append(f'<tr><td></td><td class="won">Total military</td>'
                            f'<td class="num won">{tb}</td><td class="num won">{tm or "—"}</td>'
-                           f'<td class="num won">{u["military_lost"] or "—"}</td>'
+                           f'<td class="num won">{tl or "—"}</td>'
                            f'<td class="num won">{ta}</td></tr>')
+                if u["military_lost"] > tl + 2:
+                    out.append(f'<tr><td></td><td>Unattributed losses (est)</td>'
+                               f'<td></td><td></td>'
+                               f'<td class="num">{u["military_lost"] - tl}</td>'
+                               f'<td></td></tr>')
                 if u["villagers_lost"]:
                     out.append(f'<tr><td></td><td>Villagers (est)</td><td></td><td></td>'
                                f'<td class="num">{u["villagers_lost"]}</td><td></td></tr>')
@@ -2194,7 +2237,8 @@ def build_html(doc):
                            '(damage est):</div>')
                 for b in w["buildings"][:6]:
                     by = ", ".join(f"{esc(k)} ~{v}%" for k, v in b["by"].items())
-                    out.append(f'<div class="bside">{esc(b["building"])} '
+                    seg = f' ×{b["segments"]}' if b["segments"] > 1 else ""
+                    out.append(f'<div class="bside">{esc(b["building"])}{seg} '
                                f'<span class="num">~{b["damage_pct_est"]}% ({by})</span></div>')
             out.append("</details>")
         out.append("</div></div>")
