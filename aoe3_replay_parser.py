@@ -1249,10 +1249,14 @@ def build_events(path, game, players, cmds, protos, techs, objects=None,
             "map": game.get("gamefilename"),
             "map_set": game.get("gamemapname"),
             "num_players": game.get("gamenumplayers"),
-            "treaty": bool(game.get("gamestartwithtreaty")),
-            "trade_monopoly": bool(game.get("gametrademonopoly")),
-            "team_lock": bool(game.get("gameteamlock")),
-            "free_for_all": bool(game.get("gamefreeforall")),
+            # raw lobby flags; decoding of this field family is unverified
+            # (gamestartwithtreaty reads true on games with minute-8 combat)
+            "raw_flags_unverified": {
+                "gamestartwithtreaty": bool(game.get("gamestartwithtreaty")),
+                "gametrademonopoly": bool(game.get("gametrademonopoly")),
+                "gameteamlock": bool(game.get("gameteamlock")),
+                "gamefreeforall": bool(game.get("gamefreeforall")),
+            },
             "random_seed": game.get("gamerandomseed"),
         },
         "players": [
@@ -2009,9 +2013,7 @@ def build_html(doc):
     g = doc["game"]
     map_disp = re.sub(r"^(eu|yp|de|xp)(?=[A-Z])", "", g["map"] or "?")
     map_disp = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", map_disp)
-    mode = " · ".join(x for x in [
-        f"{g['num_players']} players", "treaty" if g["treaty"] else None,
-        "FFA" if g["free_for_all"] else None] if x)
+    mode = f"{g['num_players']} players"
     winners = [p["name"] for p in players if not p["resigned"]]
     out.append(f"<main><h1>{esc(map_disp)}</h1>")
     out.append(f'<div class="meta">{esc(g["name"])} · {mode} · {doc["duration"]} · '
@@ -2510,10 +2512,11 @@ def format_report(path, game, players, cmds, protos, techs):
     out.append(f"Game name: {game.get('gamename')}")
     out.append(f"Map: {game.get('gamefilename')} ({game.get('gamemapname')})")
     out.append(f"Players: {game.get('gamenumplayers')}")
-    out.append(f"Treaty: {'on' if game.get('gamestartwithtreaty') else 'off'}"
-               f" | Trade monopoly: {'on' if game.get('gametrademonopoly') else 'off'}"
-               f" | Team lock: {'on' if game.get('gameteamlock') else 'off'}"
-               f" | FFA: {'on' if game.get('gamefreeforall') else 'off'}")
+    out.append("Lobby flags (raw, decoding unverified): "
+               f"startwithtreaty={bool(game.get('gamestartwithtreaty'))} "
+               f"trademonopoly={bool(game.get('gametrademonopoly'))} "
+               f"teamlock={bool(game.get('gameteamlock'))} "
+               f"ffa={bool(game.get('gamefreeforall'))}")
     out.append("")
     out.append("=== PLAYERS ===")
     for pid, p in sorted(players.items()):
